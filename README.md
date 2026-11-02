@@ -26,4 +26,4 @@ lede 里 RT-ACRH17 和 RT-AC42U 共用 `asus_rt-ac42u` 定义，所以固件文�
 - 从原厂固件首次刷入：用文件名含 `initramfs` 的镜像，具体步骤见 [OpenWrt Wiki](https://openwrt.org/toh/asus/rt-acrh17)
 - 已经是 OpenWrt：直接用 `squashfs-sysupgrade.bin` 升级
 
-固件大小上限约 19.5 MB，软件包加太多会导致镜像生成不出来。
+硬件是 IPQ4019 + 256 MB 内存 + 128 MB NAND，Docker、AdGuardHome 这类重型插件跑起来会很吃力，插件别贪多。
