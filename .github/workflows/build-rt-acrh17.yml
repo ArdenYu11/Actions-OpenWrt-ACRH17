@@ -130,5 +130,5 @@ jobs:
           body: |
             - 源码：coolsnowwolf/lede ${{ env.LEDE_COMMIT }}
             - 默认后台：http://192.168.1.1 ，用户 root，密码 password
-            - 从原厂固件首次刷机用文件名含 `initramfs` 的镜像，进入 OpenWrt 后再用 `squashfs-sysupgrade.bin` 升级
+            - 刷机用 `squashfs-sysupgrade.bin`，从原厂固件首次刷入的步骤见仓库 README
           files: ${{ env.FIRMWARE }}/*
