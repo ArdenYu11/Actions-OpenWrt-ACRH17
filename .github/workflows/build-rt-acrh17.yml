@@ -89,6 +89,13 @@ jobs:
             echo "::error::机型没有被选中（${DEVICE_SYMBOL}），请检查 ${CONFIG_FILE}"
             exit 1
           fi
+          # defconfig 会丢弃不存在或依赖不满足的软件包，确认显式选中的包都已启用。
+          while IFS= read -r package; do
+            if ! grep -Fqx "$package" .config; then
+              echo "::error::软件包配置未生效：${package}，请检查软件源及依赖"
+              exit 1
+            fi
+          done < <(grep -E '^CONFIG_PACKAGE_[^=]+=y$' "$GITHUB_WORKSPACE/$CONFIG_FILE")
 
       - name: Download sources
         run: |
