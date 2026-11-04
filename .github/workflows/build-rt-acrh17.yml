@@ -5,11 +5,6 @@ name: Build RT-ACRH17 (lede)
 
 on:
   workflow_dispatch:
-    inputs:
-      release:
-        description: '编译完成后发布 Release'
-        type: boolean
-        default: true
 
 permissions:
   contents: write
@@ -130,8 +125,8 @@ jobs:
           name: RT-ACRH17-${{ env.BUILD_DATE }}
           path: ${{ env.FIRMWARE }}
 
+      # 编译成功就发布，不用每次勾选
       - name: Publish release
-        if: inputs.release
         uses: softprops/action-gh-release@v3
         with:
           tag_name: rt-acrh17-${{ env.BUILD_DATE }}
