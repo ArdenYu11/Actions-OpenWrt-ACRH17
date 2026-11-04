@@ -1,0 +1,7 @@
+#!/bin/sh
+# lede 内核是 6.18，软件源却默认指向官方 24.10.5（内核 6.6）。
+# 源里的 ipq40xx 目标包和内核模块装到本固件上用不了，这里把它们注释掉；
+# 需要的内核模块请在 acrh17.config 里选上编进固件。
+# 文件名排在 zzz-default-settings 之后，免得被它的 s/# //g 改回来。
+sed -i '/\/targets\//s/^src/# src/' /etc/opkg/distfeeds.conf
+exit 0

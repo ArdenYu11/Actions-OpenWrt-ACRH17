@@ -17,10 +17,19 @@ Actions → **Build RT-ACRH17 (lede)** → Run workflow。首次编译约 2–3 
 | `acrh17.config` | 机型和软件包配置，需要的包追加 `CONFIG_PACKAGE_xxx=y` |
 | `diy-part1.sh` | 更新 feeds 前执行，增删 feeds 源 |
 | `diy-part2.sh` | 安装 feeds 后执行，改默认 IP 等 |
+| `files/` | 里面的文件原样放进固件根目录，例如 `files/etc/uci-defaults/` 下的脚本会在首次开机时执行 |
 
 lede 里 RT-ACRH17 和 RT-AC42U 共用 `asus_rt-ac42u` 定义，所以固件文件名里是 `asus_rt-ac42u`。
 
 硬件是 IPQ4019 + 256 MB 内存 + 128 MB NAND，Docker、AdGuardHome 这类重型插件跑起来会很吃力，插件别贪多。
+
+## 软件源与内核模块
+
+lede 的内核是 6.18，但它把固件里的软件源写死成了官方 OpenWrt 24.10.5（内核 6.6）。网上没有任何源提供和本固件内核匹配的内核模块（`kmod-*`），所以：
+
+- **需要内核模块的功能，都在 `acrh17.config` 里选上编进固件**，例如 `CONFIG_PACKAGE_kmod-tun=y`。依赖的模块会自动带进来
+- 固件首次开机时会自动注释掉软件源里的 core 源（ipq40xx 目标包），免得装到不匹配的包，见 `files/etc/uci-defaults/zzzz-acrh17-distfeeds`
+- 其余软件源还能用 opkg 装一些纯用户态的小工具，但依赖内核模块的包会因为缺依赖装不上，这类包同样要编进固件
 
 ## 刷机
 

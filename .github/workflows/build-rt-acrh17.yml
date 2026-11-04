@@ -79,6 +79,8 @@ jobs:
 
       - name: Load config and run diy-part2.sh
         run: |
+          # files/ 里的文件会原样放进固件根目录
+          if [ -d files ]; then cp -r files openwrt/; fi
           cp "$CONFIG_FILE" openwrt/.config
           chmod +x "$DIY_P2_SH"
           cd openwrt
