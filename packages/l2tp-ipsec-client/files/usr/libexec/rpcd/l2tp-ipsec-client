@@ -75,13 +75,10 @@ call)
 		json_add_string address "$address"
 		json_add_string probe_ip "$probe_ip"
 		json_add_string routing_mode "${routing_mode:-rules}"
-		reachable=unknown
-		if [ "$phase" = connected ] && [ "$ipsec" = 1 ] && [ "$ppp" = 1 ] && [ -n "$probe_ip" ]; then
-			if ip -4 route get "$probe_ip" 2>/dev/null | grep -q 'dev l2tp-vpn '; then
-				if ping -I l2tp-vpn -c 1 -W 1 "$probe_ip" >/dev/null 2>&1; then reachable=yes; else reachable=no; fi
-			else reachable=no_route; fi
-		fi
-		json_add_string reachable "$reachable"
+		LP_PROBE_REACH=unknown; LP_PROBE_ADDRESS=""
+		if [ "$phase" = connected ] && [ "$ipsec" = 1 ] && [ "$ppp" = 1 ]; then lp_probe; fi
+		json_add_string reachable "$LP_PROBE_REACH"
+		json_add_string probe_address "$LP_PROBE_ADDRESS"
 		json_dump
 	;;
 	logs)

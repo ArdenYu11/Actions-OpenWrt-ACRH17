@@ -19,12 +19,14 @@ CONFIG_PACKAGE_luci-app-l2tp-ipsec-client=y
 刷机后进入 **VPN → L2TP/IPsec 客户端**：
 
 1. 填写服务器、用户名、密码和 PSK。
-2. 在「流量路由」选择「全流量」或「规则分流」。规则分流中可同时填写指定网段、完整域名、域名前缀和域名后缀，命中任一规则即走 VPN。
+2. 在「流量路由」选择「全流量」或「规则分流」。规则分流使用一个「已添加规则」列表，点击「添加规则」在弹窗选择指定网段或域名；域名再选择完整域名、前缀或后缀。列表支持编辑和删除，命中任一规则即走 VPN。
 3. 使用全流量或域名规则时，VPN DNS 留空则使用 PPP 下发的地址；未下发时填写可经 VPN 访问的 IPv4 DNS 地址。
-4. 可填写允许 Ping 的内网 IP 作为探测地址。
+4. 可填写允许 Ping 的 IPv4 地址或域名作为内网探测地址。域名先解析为 IPv4，再检查路由和 Ping；规则分流时需要命中已添加的网段或域名规则。页面会区分域名解析失败、缺少 VPN 路由和 Ping 未响应。
 5. 点击「保存并连接」，观察 IPsec、PPP 和探测结果。
 
 「保存设置」只保存参数，下次连接时生效。「开机自动连接」决定重启后是否连接。「断开连接」停止本次运行，开启自动连接时下次开机会再连接。
+
+「断线自动重连」支持最大重连次数（默认 0，表示不限次数）和最大重连间隔（默认 30 秒，范围 1–3600 秒）。首次连接不计入重连次数，成功连接后次数和间隔重新开始；到达次数上限停止。每次等待按 1、2、3、5、8……秒递增，触及最大间隔后从 1 秒循环。例如最大间隔 8 秒：`1、2、3、5、8、1、2……`；最大间隔 6 秒：`1、2、3、5、6、1、2……`。已有配置的 `retry_interval` 作为最大间隔使用。
 
 默认 IKE `aes256-sha256-modp2048`、ESP `aes256-sha1`、MTU/MRU 1400、PPP 保活 30 秒/5 次。高级设置提供随包安装的算法组合和身份标识。
 
@@ -79,6 +81,8 @@ python3 tests/test_backend.py
 python3 tests/test_linux_integration.py
 python3 tests/test_domain_dns.py
 python3 tests/test_routing.py
+python3 tests/test_retry_probe.py
+node tests/test_ui_rules.js
 node --check packages/luci-app-l2tp-ipsec-client/htdocs/luci-static/resources/view/l2tp-ipsec-client.js
 ```
 

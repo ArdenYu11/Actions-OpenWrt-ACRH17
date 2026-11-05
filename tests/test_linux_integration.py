@@ -28,7 +28,7 @@ class WorkerTests(unittest.TestCase):
 lp_load() {
  server=vpn.example.com; username=test; password=test; psk=test
  ike=aes256-sha256-modp2048; esp=aes256-sha1; local_id=; remote_id=
- mtu=1400; lcp_interval=30; lcp_failure=5; retry_interval=10
+ mtu=1400; lcp_interval=30; lcp_failure=5; retry_interval=${TEST_RETRY_INTERVAL:-10}; retry_max_attempts=${TEST_MAX_RETRIES:-0}
  probe_ip=; routes=; routing_mode=rules; reconnect=${TEST_RECONNECT:-0}
 }
 lp_state() { printf '%s|%s\\n' "$1" "$2" >> "$TEST_TRACE"; }
@@ -42,7 +42,7 @@ lp_swan() { return 0; }
         self.env = {**os.environ, 'LP_DIR': str(self.runtime), 'LP_LIB': str(self.lib),
                     'TEST_TRACE': str(self.trace), 'PATH': str(self.bin) + ':' + os.environ['PATH']}
         mocks = {
-            'resolveip': 'echo 192.0.2.20',
+            'resolveip': '[ "${TEST_RESOLVE_FAIL:-0}" = 0 ] && echo 192.0.2.20',
             'pidof': '[ "${TEST_CONFLICT:-0}" = 1 ]',
             'ip': '''case "$*" in
 *"route get"*) echo "192.0.2.20 via 172.17.0.1 dev eth0 src 172.17.0.2" ;;
@@ -134,6 +134,15 @@ wait "$child"''',
         trace = self.trace.read_text()
         self.assertIn('disconnected|', trace)
         self.assertIn('ip xfrm policy delete', trace)
+
+    def test_reconnect_limit_stops_after_configured_retries(self):
+        self.start(TEST_RECONNECT='1', TEST_MAX_RETRIES='3', TEST_RETRY_INTERVAL='1', TEST_RESOLVE_FAIL='1')
+        self.process.wait(timeout=7)
+        trace = self.trace.read_text()
+        self.assertEqual(trace.count('resolving|'), 4)
+        self.assertEqual(trace.count('retrying|'), 3)
+        self.assertIn('已达到最大重连次数（3 次）', trace)
+        self.assertFalse((self.runtime / 'lock').exists())
 
     def test_retry_and_manual_stop(self):
         self.start(TEST_RECONNECT='1')
