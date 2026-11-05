@@ -1,36 +1,21 @@
 #!/bin/sh
 
 umask 077
-LP_DIR=/var/run/l2tp-ipsec-client
+. /usr/lib/l2tp-ipsec-client/common.sh
 
 down() {
-	if [ -f "$LP_DIR/installed-routes" ]; then
-		while IFS= read -r route; do
-			[ -n "$route" ] && ip -4 route del "$route" dev l2tp-vpn metric 41717 2>/dev/null
-		done < "$LP_DIR/installed-routes"
-	fi
-	rm -f "$LP_DIR/ppp.up" "$LP_DIR/installed-routes" "$LP_DIR/route.error"
+ "$LP_LIB/routing" down
+ rm -f "$LP_DIR/ppp.up"
 }
 
-if [ "$1" = down ]; then
-	down
-	exit 0
-fi
-
+if [ "$1" = down ]; then down; exit 0; fi
 [ "${PPP_IFACE:-$2}" = l2tp-vpn ] || exit 0
 [ -d /sys/class/net/l2tp-vpn ] || { down; exit 0; }
-# 直接检查接口地址，兼容不同 PPP 版本。
 ip -4 address show dev l2tp-vpn | grep -q 'inet ' || { down; exit 0; }
 printf '%s\n' "${PPPD_PID:-$PPID}" > "$LP_DIR/ppp.pid"
-: > "$LP_DIR/installed-routes"
 rm -f "$LP_DIR/route.error"
-while IFS= read -r route; do
-	[ -n "$route" ] || continue
-	if ip -4 route add "$route" dev l2tp-vpn metric 41717; then
-		printf '%s\n' "$route" >> "$LP_DIR/installed-routes"
-		ip -4 route get "${route%/*}" | grep -q 'dev l2tp-vpn ' || : > "$LP_DIR/route.error"
-	else
-		: > "$LP_DIR/route.error"
-	fi
-done < "$LP_DIR/routes"
+if ! "$LP_LIB/routing" up; then
+ [ -s "$LP_DIR/route.error" ] || printf '%s\n' '路由或 DNS 设置失败，请检查表 41717、规则优先级及 DNS 端口。' > "$LP_DIR/route.error"
+ "$LP_LIB/routing" down
+fi
 : > "$LP_DIR/ppp.up"

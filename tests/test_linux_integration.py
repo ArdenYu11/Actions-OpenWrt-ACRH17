@@ -29,7 +29,7 @@ lp_load() {
  server=vpn.example.com; username=test; password=test; psk=test
  ike=aes256-sha256-modp2048; esp=aes256-sha1; local_id=; remote_id=
  mtu=1400; lcp_interval=30; lcp_failure=5; retry_interval=10
- probe_ip=; routes=; reconnect=${TEST_RECONNECT:-0}
+ probe_ip=; routes=; routing_mode=rules; reconnect=${TEST_RECONNECT:-0}
 }
 lp_state() { printf '%s|%s\\n' "$1" "$2" >> "$TEST_TRACE"; }
 lp_has_ipsec() { [ "${TEST_PHASE:-}" = ppp ]; }

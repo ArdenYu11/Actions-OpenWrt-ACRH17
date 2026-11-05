@@ -17,7 +17,7 @@ function E(tag, attrs, children) {
 
 const config = {
  server: '', username: '', password: '', psk: '', enabled: '0', reconnect: '1',
- routes: [], probe_ip: '', ike: 'aes256-sha256-modp2048', esp: 'aes256-sha1',
+ routing_mode: 'rules', vpn_dns: '', domains: [], domain_prefixes: [], domain_suffixes: [], routes: [], probe_ip: '', ike: 'aes256-sha256-modp2048', esp: 'aes256-sha1',
  local_id: '', remote_id: '', mtu: '1400', lcp_interval: '30', lcp_failure: '5', retry_interval: '30'
 };
 let scenario = 'disconnected';
@@ -51,7 +51,8 @@ function setScenario(value) {
  const connected = ['connected', 'probe_error'].includes(value);
  state = {
   phase: connected ? 'connected' : value === 'disconnected' ? 'disconnected' : 'error',
-  message: connected ? 'VPN 已连接，指定内网路由已生效。' : value === 'psk_error' ? 'IPsec 协商失败，请检查 PSK、身份标识和加密算法。' : value === 'ppp_error' ? 'PPP 连接失败，请检查账号密码、PAP 设置和 UDP 1701 连通性。' : '尚未连接。',
+  routing_mode: config.routing_mode,
+  message: connected ? (config.routing_mode === 'full' ? 'VPN 已连接，全流量模式已生效。' : 'VPN 已连接，网段与域名规则分流已生效。') : value === 'psk_error' ? 'IPsec 协商失败，请检查 PSK、身份标识和加密算法。' : value === 'ppp_error' ? 'PPP 连接失败，请检查账号密码、PAP 设置和 UDP 1701 连通性。' : '尚未连接。',
   running: connected, ipsec: connected || value === 'ppp_error', ppp: connected,
   address: connected ? '10.20.1.25/32' : '', probe_ip: value === 'probe_error' ? '10.20.0.10' : config.probe_ip,
   reachable: value === 'probe_error' ? 'no' : connected && config.probe_ip ? 'yes' : 'unknown'
@@ -82,7 +83,7 @@ const rpc = {
     move(1800, {phase:'ppp', ipsec:true, message:'IPsec 已建立，正在验证账号并连接 PPP。'});
     if (scenario === 'ppp_error') move(3200, {phase:'error', running:false, message:'PPP 连接失败，请检查账号密码和 PAP 设置。'});
     else move(3200, {phase:'connected', ipsec:true, ppp:true, address:'10.20.1.25/32', probe_ip:config.probe_ip,
-     reachable:config.probe_ip ? scenario === 'probe_error' ? 'no' : 'yes' : 'unknown', message:'VPN 已连接，指定内网路由已生效。'});
+     reachable:config.probe_ip ? scenario === 'probe_error' ? 'no' : 'yes' : 'unknown', routing_mode:config.routing_mode, message:config.routing_mode === 'full' ? 'VPN 已连接，全流量模式已生效。' : 'VPN 已连接，网段与域名规则分流已生效。'});
    }
    return {ok:true, message:'已开始连接，请查看连接状态。'};
   }
@@ -92,6 +93,7 @@ const rpc = {
 class Option {
  constructor(tab, type, key, title) { Object.assign(this, {tab,type,key,title,choices:[]}); }
  value(value, title) { this.choices.push([value,title]); }
+ depends(key,value) { this.dependency={key,value}; }
  render() {
   this.field = E('div', {class:'cbi-value-field'});
   const value = config[this.key] ?? this.default ?? '';
@@ -101,12 +103,12 @@ class Option {
    const add = text => {
     const input = E('input', {type:'text', placeholder:this.placeholder || '', 'aria-label':this.title});
     input.value = text || '';
-    const row = E('div', {class:'dynamic-row'}, [input, E('button', {type:'button', 'aria-label':'删除网段', click:()=>row.remove()}, '−')]);
+    const row = E('div', {class:'dynamic-row'}, [input, E('button', {type:'button', 'aria-label':'删除规则', click:()=>row.remove()}, '−')]);
     this.rows.append(row);
    };
    (Array.isArray(value) ? value : []).forEach(add);
    if (!this.rows.children.length) add('');
-   this.field.append(this.rows, E('button', {type:'button', class:'add-row',click:()=>add('')}, '+ 添加网段'));
+   this.field.append(this.rows, E('button', {type:'button', class:'add-row',click:()=>add('')}, '+ 添加规则'));
   } else {
    this.input = this.type === 'ListValue' ? E('select') : E('input', {type:this.type === 'Flag' ? 'checkbox' : this.password ? 'password' : 'text'});
    this.input.id = 'field-' + this.key;
@@ -121,7 +123,8 @@ class Option {
    else this.field.append(this.input);
   }
   if (this.description) this.field.append(E('div',{class:'cbi-value-description'},this.description));
-  return E('div',{class:'cbi-value'},[E('label',{class:'cbi-value-title',for:'field-'+this.key},this.title),this.field]);
+  this.node = E('div',{class:'cbi-value'},[E('label',{class:'cbi-value-title',for:'field-'+this.key},this.title),this.field]);
+  return this.node;
  }
  read() {
   if (this.type === 'DummyValue') return undefined;
@@ -168,6 +171,10 @@ class FormMap {
    tabs.append(E('button',{type:'button','data-tab':key,role:'tab',click:()=>show(key)},title));
    panels.append(E('div',{'data-panel':key,role:'tabpanel'},s.options.filter(o=>o.tab===key).map(o=>o.render())));
   }
+  const update=()=>s.options.forEach(o=>{
+   if(o.dependency) { const parent=s.options.find(p=>p.key===o.dependency.key);o.node.hidden=parent.read()!==o.dependency.value; }
+  });
+  panels.addEventListener('change',update);update();
   show(s.tabs[0][0]);
   return E('div',{class:'cbi-map'},[tabs,panels]);
  }
@@ -175,7 +182,7 @@ class FormMap {
   const updated={};let firstError;
   for(const option of this.sectionObj.options){
    const value=option.read();if(value===undefined)continue;
-   const result=option.check(value);
+   const result=option.node.hidden ? true : option.check(value);
    if(result!==true)firstError=firstError||result;
    updated[option.key]=value;
   }

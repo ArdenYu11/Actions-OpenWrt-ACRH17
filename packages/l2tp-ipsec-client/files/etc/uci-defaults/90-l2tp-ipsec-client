@@ -54,6 +54,16 @@ uci set firewall.l2tpipsec_snat.position=chain-prepend
 uci set firewall.l2tpipsec_snat.chain=srcnat
 uci commit firewall
 
+# DNS 模块只向 LAN 和路由器本机提供服务。
+uci set firewall.l2tpipsec_dns=rule
+uci set firewall.l2tpipsec_dns.name='Allow-L2TP-IPsec-DNS'
+uci set firewall.l2tpipsec_dns.src=lan
+uci set firewall.l2tpipsec_dns.proto='tcp udp'
+uci set firewall.l2tpipsec_dns.dest_port=1053
+uci set firewall.l2tpipsec_dns.family=any
+uci set firewall.l2tpipsec_dns.target=ACCEPT
+uci commit firewall
+
 # 由 UCI 开关决定是否在开机时连接，初始配置默认关闭。
 /etc/init.d/l2tp-ipsec-client enable
 [ -n "$IPKG_INSTROOT" ] || {

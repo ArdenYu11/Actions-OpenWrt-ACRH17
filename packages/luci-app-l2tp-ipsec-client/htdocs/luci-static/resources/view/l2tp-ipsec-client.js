@@ -30,6 +30,14 @@ function ipv4(value) {
  });
 }
 
+function domain(value, prefix) {
+ if (!value) return true;
+ if (prefix) value = value.replace(/\.$/, '');
+ return value.length <= 253 && value.split('.').every(function(label) {
+  return label.length >= 1 && label.length <= 63 && /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/.test(label);
+ }) ? true : '请填写域名文本，不包含协议、端口、路径或通配符。';
+}
+
 return view.extend({
  load: function() {
   return Promise.all([uci.load('l2tpipsec'), statusRPC(), logsRPC()]);
@@ -42,7 +50,7 @@ return view.extend({
   var s = m.section(form.NamedSection, 'main', 'client');
   s.addremove = false;
   s.tab('basic', '连接设置');
-  s.tab('routes', '内网访问');
+  s.tab('routes', '流量路由');
   s.tab('advanced', '高级设置');
   var o;
 
@@ -68,19 +76,38 @@ return view.extend({
   o = s.taboption('basic', form.Flag, 'reconnect', '断线自动重连');
   o.default = '1'; o.rmempty = false;
 
-  o = s.taboption('routes', form.DynamicList, 'routes', '需要访问的内网网段');
+  o = s.taboption('routes', form.ListValue, 'routing_mode', '路由模式');
+  o.value('full', '全流量');
+  o.value('rules', '规则分流');
+  o.default = 'rules'; o.rmempty = false;
+  o.description = '全流量：IPv4 外网流量走 VPN，保留已有本地路由，阻止 IPv6 外网。规则分流：命中下方任意网段或域名规则即走 VPN，其余使用原有出口。';
+  o = s.taboption('routes', form.DynamicList, 'routes', '指定网段');
+  o.depends('routing_mode', 'rules'); o.retain = true;
   o.placeholder = '10.20.0.0/16';
-  o.description = '仅这些 IPv4 网段走 VPN，其余流量继续使用原有出口。LAN 内设备可以通过路由器访问这些网段。';
+  o.description = 'IPv4 CIDR 网段，可与三类域名规则同时使用。直连网段通过原有接口访问。';
   o.validate = function(section, value) {
    if (!value) return true;
    var parts = value.split('/');
    return parts.length === 2 && ipv4(parts[0]) && /^\d{1,2}$/.test(parts[1]) &&
     Number(parts[1]) >= 1 && Number(parts[1]) <= 32
-     ? true : '请填写 IPv4 CIDR 网段，例如 10.20.0.0/16；不支持默认路由 /0。';
+     ? true : '请填写 IPv4 CIDR 网段，例如 10.20.0.0/16；全流量请切换模式。';
   };
+  [
+   ['domains', '完整域名', 'api.example.com', '只匹配完整域名，例如 api.example.com，不包括它的子域。'],
+   ['domain_prefixes', '域名前缀', 'api.', '匹配域名开头，例如 api. 匹配 api.example.com；internal- 匹配 internal-app.example.com。'],
+   ['domain_suffixes', '域名后缀', 'example.com', '匹配该域名及其全部子域，例如 example.com 和 api.example.com；不匹配 badexample.com。']
+  ].forEach(function(item) {
+   o = s.taboption('routes', form.DynamicList, item[0], item[1]);
+   o.depends('routing_mode', 'rules'); o.retain = true; o.placeholder = item[2];
+   o.description = item[3] + ' 不区分大小写。';
+   o.validate = function(section, value) { return domain(value, item[0] === 'domain_prefixes'); };
+  });
+  o = s.taboption('routes', form.Value, 'vpn_dns', 'VPN DNS（可选）');
+  o.placeholder = '自动使用 VPN 下发的 DNS'; o.datatype = 'ip4addr';
+  o.description = '全流量或使用域名规则时需要可用的 VPN DNS。留空则使用 PPP 下发的地址；未下发时请填写。域名规则要求设备使用路由器 DNS，DoH/DoT 和已有缓存不会触发匹配；共享 IP 的其他域名也可能走 VPN。';
   o = s.taboption('routes', form.Value, 'probe_ip', '内网探测地址（可选）');
   o.placeholder = '10.20.0.10'; o.datatype = 'ip4addr';
-  o.description = '填写允许 Ping 的内网 IP，连接后检查其是否可达。该地址应包含在上方网段中。';
+  o.description = '填写允许 Ping 的内网 IP，连接后检查其是否经 VPN 可达。规则分流时应包含在指定网段内。';
 
   o = s.taboption('advanced', form.DummyValue, '_protocol', '协议与认证');
   o.cfgvalue = function() { return 'L2TP over IPsec · IKEv1 · Transport · PSK + PAP'; };
@@ -121,7 +148,7 @@ return view.extend({
    var node = E('div', { 'class': 'lp-page' }, [
     E('style', {}, '.lp-status{padding:18px 20px;border:1px solid #dbe2ea;border-radius:8px;background:#f8fafc;margin:0 0 22px;color:#263548}.lp-status-heading{display:flex;align-items:center;gap:10px;margin-bottom:8px}.lp-badge{font-weight:600;padding:3px 10px;border-radius:20px;background:#e5eaf0;color:#536273}.lp-badge[data-phase="connected"]{background:#dcfce7;color:#166534}.lp-badge[data-phase="error"],.lp-badge[data-phase="conflict"]{background:#fee2e2;color:#991b1b}.lp-steps{display:flex;gap:28px;margin-top:16px;flex-wrap:wrap}.lp-step{font-size:13px;color:#59687b}.lp-step[data-ok="true"]{color:#15803d}.lp-actions{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}.lp-log{white-space:pre-wrap;overflow-wrap:anywhere;background:#152132;color:#d7e3f0;padding:18px;border-radius:8px;min-height:100px;max-height:300px;overflow:auto;font-size:12px;line-height:1.7}.lp-details{color:#69798b;font-size:12px;margin-top:12px}.lp-note{font-size:13px;color:#66778a;margin-top:16px}.lp-page details>summary{cursor:pointer;margin:18px 0 10px;font-weight:600}'),
     E('h2', {}, 'L2TP/IPsec 客户端'),
-    E('p', { 'class': 'lp-note' }, '填写连接信息，安全访问远端内网。'),
+    E('p', { 'class': 'lp-note' }, '填写连接信息，选择全流量或网段与域名规则分流。'),
     self.statusNode,
     mapNode,
     E('div', { 'class': 'lp-actions' }, [self.connectButton, self.stopButton, self.saveButton]),
@@ -148,7 +175,7 @@ return view.extend({
    E('div', { 'class': 'lp-steps' }, steps.map(function(step) {
     return E('div', { 'class': 'lp-step', 'data-ok': String(step[2]) }, step[0] + '：' + step[1]);
    })),
-   E('div', { 'class': 'lp-details' }, state.address ? 'VPN 地址：' + state.address + ' · 接口：l2tp-vpn' : '接口：l2tp-vpn')
+   E('div', { 'class': 'lp-details' }, state.address ? 'VPN 地址：' + state.address + ' · 模式：' + (state.routing_mode === 'full' ? '全流量' : '规则分流') + ' · 接口：l2tp-vpn' : '接口：l2tp-vpn')
   );
   this.logNode.textContent = logs.log || '暂无连接日志。';
   this.stopButton.disabled = !state.running;

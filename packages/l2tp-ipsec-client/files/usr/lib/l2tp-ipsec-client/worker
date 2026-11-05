@@ -109,11 +109,17 @@ attempt() {
 	done
 	[ -f "$LP_DIR/ppp.up" ] || { lp_state error 'PPP 连接失败，请检查账号密码、PAP 设置和 UDP 1701 连通性。'; return 1; }
 	if [ -f "$LP_DIR/route.error" ]; then
-		lp_state error 'PPP 已连接，但内网路由设置失败；连接已停止，请检查网段冲突。'
+		read -r route_error < "$LP_DIR/route.error"
+		lp_state error "$route_error"
 		return 2
 	fi
-	lp_state connected 'VPN 已连接，指定内网路由已生效。'
+	if [ "$routing_mode" = full ]; then lp_state connected 'VPN 已连接，全流量模式已生效（IPv4，IPv6 外网已阻止）。'
+	else lp_state connected 'VPN 已连接，网段与域名规则分流已生效。'; fi
 	while lp_alive "$charon_pid" && lp_alive "$l2tp_pid" && [ -f "$LP_DIR/ppp.up" ] && lp_has_ipsec; do
+		if [ -f "$LP_DIR/dns.pid" ]; then
+			read -r dns_pid < "$LP_DIR/dns.pid"
+			lp_alive "$dns_pid" || { lp_state error 'DNS 分流进程退出，正在停止连接。'; return 1; }
+		fi
 		lp_sleep 5
 	done
 	lp_state error '连接中断。'

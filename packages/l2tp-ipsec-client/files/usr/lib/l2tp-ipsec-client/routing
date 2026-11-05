@@ -1,0 +1,121 @@
+#!/bin/sh
+
+umask 077
+. /usr/lib/l2tp-ipsec-client/common.sh
+LP_TABLE=41717
+LP_MARK=41717
+
+routing_down() {
+	if [ -f "$LP_DIR/dns.pid" ]; then
+		read -r dns_pid < "$LP_DIR/dns.pid"
+		case "$dns_pid" in ''|*[!0-9]*) ;; *)
+			if [ "$(cat "/proc/$dns_pid/comm" 2>/dev/null)" = domain-dns ]; then lp_stop_pid "$dns_pid"; fi
+		;; esac
+	fi
+	[ ! -f "$LP_DIR/dns-owned" ] || nft delete table inet l2tpipsec_dns 2>/dev/null
+	if [ -f "$LP_DIR/routing-owned" ]; then
+		for priority in 10100 10101 10102 10103 10104; do
+			while ip -4 rule del priority "$priority" 2>/dev/null; do :; done
+		done
+		ip -4 route flush table "$LP_TABLE" 2>/dev/null
+	fi
+	rm -f "$LP_DIR/dns.pid" "$LP_DIR/dns.ready" "$LP_DIR/routing-owned" "$LP_DIR/active-dns" "$LP_DIR/dns-owned"
+}
+
+routing_up() {
+	local mode dns server_ip route device devices dns_pid
+	read -r mode < "$LP_DIR/routing-mode"
+	read -r dns < "$LP_DIR/configured-dns"
+	read -r server_ip < "$LP_DIR/server-ip"
+	# 独占表和优先级，发现其他路由管理器占用时不覆盖。
+	[ -z "$(ip -4 route show table "$LP_TABLE" 2>/dev/null)" ] || return 1
+	ip -4 rule show | awk '$1 ~ /^1010[0-4]:$/ {found=1} END {exit !found}' && return 1
+	: > "$LP_DIR/routing-owned"
+	ip -4 rule add priority 10100 to "$server_ip/32" lookup main || return 1
+	ip -4 rule add priority 10102 fwmark "$LP_MARK" lookup main || return 1
+	# 全流量保留已有明确出口；规则模式保留直连网段。
+	if [ "$mode" = full ]; then
+		ip -4 rule add priority 10103 lookup main suppress_prefixlength 0 || return 1
+	else
+		ip -4 route show table main scope link | awk '{print $1}' > "$LP_DIR/direct-routes"
+		while IFS= read -r route; do
+			[ -n "$route" ] || continue
+			ip -4 rule add priority 10103 to "$route" lookup main || return 1
+		done < "$LP_DIR/direct-routes"
+	fi
+	ip -4 rule add priority 10104 lookup "$LP_TABLE" || return 1
+	if [ "$mode" = full ]; then
+		ip -4 route add default dev "$LP_IFACE" table "$LP_TABLE" proto static || return 1
+	else
+		while IFS= read -r route; do
+			[ -n "$route" ] || continue
+			ip -4 route replace "$route" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41717 || return 1
+		done < "$LP_DIR/routes"
+	fi
+	# 没有域名规则时，网段分流无需 DNS 模块。
+	[ "$mode" = full ] || [ -s "$LP_DIR/domain-rules" ] || return 0
+	[ -n "$dns" ] || dns=${DNS1:-${DNS2:-}}
+	lp_ip4 "$dns" && [ "$dns" != "$server_ip" ] && [ "$dns" != 127.0.0.1 ] && [ "$dns" != 0.0.0.0 ] || {
+		printf '%s\n' '远端未下发可用 DNS，请填写 VPN DNS。' > "$LP_DIR/route.error"
+		return 1
+	}
+	ip -4 route replace "$dns/32" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41716 || return 1
+	ip -4 rule add priority 10101 to "$dns/32" lookup "$LP_TABLE" || return 1
+	devices=""
+	. /lib/functions/network.sh
+	network_get_device device lan
+	case "$device" in ''|*[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+	devices="\"$device\""
+	printf '%s\n' "$dns" > "$LP_DIR/active-dns"
+	nft list table inet l2tpipsec_dns >/dev/null 2>&1 && return 1
+	rm -f "$LP_DIR/dns.ready"
+	: > "$LP_DIR/dns.log"
+	"$LP_LIB/domain-dns" --rules "$LP_DIR/domain-rules" --vpn-dns "$dns" \
+		--local-dns 127.0.0.1 --mode "$mode" --listen :: --mark "$LP_MARK" \
+		--ready "$LP_DIR/dns.ready" >> "$LP_DIR/dns.log" 2>&1 &
+	dns_pid=$!
+	printf '%s\n' "$dns_pid" > "$LP_DIR/dns.pid"
+	local tries=0
+	while [ ! -f "$LP_DIR/dns.ready" ] && [ "$tries" -lt 20 ]; do
+		lp_alive "$dns_pid" || return 1
+		sleep 0.1; tries=$((tries + 1))
+	done
+	[ -f "$LP_DIR/dns.ready" ] || return 1
+	cat > "$LP_DIR/dns.nft" <<EOF
+table inet l2tpipsec_dns {
+ chain prerouting {
+  type nat hook prerouting priority -105; policy accept;
+  iifname { $devices } fib daddr type local meta l4proto { tcp, udp } th dport 53 redirect to :1053
+ }
+ chain output {
+  type nat hook output priority -105; policy accept;
+  meta mark != $LP_MARK ip daddr 127.0.0.1 meta l4proto { tcp, udp } th dport 53 redirect to :1053
+  meta mark != $LP_MARK ip6 daddr ::1 meta l4proto { tcp, udp } th dport 53 redirect to :1053
+ }
+ chain guard {
+  type filter hook input priority -5; policy accept;
+  iifname != { "lo", $devices } meta l4proto { tcp, udp } th dport 1053 drop
+ }
+EOF
+	if [ "$mode" = full ]; then
+		cat >> "$LP_DIR/dns.nft" <<EOF
+ chain ipv6_forward {
+  type filter hook forward priority -5; policy accept;
+  iifname { $devices } oifname != { $devices } meta nfproto ipv6 reject
+ }
+ chain ipv6_output {
+  type filter hook output priority -5; policy accept;
+  oifname != { "lo", $devices } ip6 daddr != { fe80::/10, ff00::/8 } reject
+ }
+EOF
+	fi
+	printf '}\n' >> "$LP_DIR/dns.nft"
+	nft -f "$LP_DIR/dns.nft" || return 1
+	: > "$LP_DIR/dns-owned"
+}
+
+case "$1" in
+up) routing_up ;;
+down) routing_down ;;
+*) exit 1 ;;
+esac

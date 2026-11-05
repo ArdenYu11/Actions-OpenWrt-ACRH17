@@ -22,6 +22,7 @@ class BackendTests(unittest.TestCase):
             'lcp_interval': '30', 'lcp_failure': '5',
             'retry_interval': '30', 'probe_ip': '10.20.0.10',
             'routes': '10.20.0.0/16 10.30.0.7/32',
+            'routing_mode': 'rules', 'vpn_dns': '', 'domains': '', 'domain_prefixes': '', 'domain_suffixes': '',
             'server_ip': '192.0.2.20', 'local_ip': '192.0.2.10',
         }
         prefix = '\n'.join(f'{key}={shlex.quote(value)}' for key, value in defaults.items())
@@ -43,6 +44,9 @@ class BackendTests(unittest.TestCase):
             'routes': ['0.0.0.0/0', '10.0.0.0/33', '999.1.2.3/16', '10.0.0.0;touch /tmp/x'],
             'mtu': ['0', '1461', '1;exit', '999999999999999999'],
             'probe_ip': ['not-an-ip', '256.0.0.1'],
+            'routing_mode': ['unknown'], 'vpn_dns': ['bad', '256.0.0.1'],
+            'domains': ['https://example.com', '*.example.com', 'example.com/path', '.example.com'],
+            'domain_prefixes': ['api..', '*.'], 'domain_suffixes': ['com.', 'foo..com'],
         }
         for key, values in cases.items():
             for value in values:
@@ -67,7 +71,7 @@ class BackendTests(unittest.TestCase):
             self.assertIn('version = 1', swan)
             self.assertIn('remote_ts = 192.0.2.20/32[udp/1701]', swan)
             self.assertIn('nodefaultroute', ppp)
-            self.assertNotIn('usepeerdns', ppp)
+            self.assertIn('usepeerdns', ppp)
             for option in ['refuse-eap', 'refuse-chap', 'refuse-mschap', 'refuse-mschap-v2']:
                 self.assertIn(option, ppp)
             self.assertNotIn('refuse-pap', ppp)
@@ -81,6 +85,23 @@ class BackendTests(unittest.TestCase):
             result = self.run_shell('routes=""\nlp_validate && lp_render', target)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((target / 'routes').read_text().strip(), '')
+
+    def test_modes_render_combined_rules(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = pathlib.Path(temp)
+            result = self.run_shell("domains='api.example.com'\ndomain_prefixes='api. internal-'\ndomain_suffixes='example.org'\nlp_validate && lp_render", target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((target / 'routing-mode').read_text().strip(), 'rules')
+            self.assertEqual((target / 'domain-rules').read_text().splitlines(), [
+                'exact api.example.com', 'prefix api.', 'prefix internal-', 'suffix example.org'])
+            result = self.run_shell("routing_mode=full\ndomains='api.example.com'\nlp_validate && lp_render", target)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((target / 'routing-mode').read_text().strip(), 'full')
+            self.assertEqual((target / 'domain-rules').read_text(), '')
+
+    def test_domain_rule_limit(self):
+        value = ' '.join('example.com' for _ in range(513))
+        self.assertNotEqual(self.run_shell(f'domains={shlex.quote(value)}\nlp_validate').returncode, 0)
 
     def test_syntax_and_json(self):
         import json

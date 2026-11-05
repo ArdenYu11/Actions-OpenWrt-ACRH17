@@ -1,5 +1,19 @@
 # 验证记录（2026-11-05）
 
+## 1.1.0：全流量与网段/域名规则分流
+
+- 配置及输入边界 7 项、路由管理 4 项、DNS UDP/TCP 与路由生命周期 8 项、工作进程生命周期 5 项通过，共 24 项。
+- DNS 检查包含精确/前缀/后缀 OR 匹配、大小写、后缀边界、CNAME 和 TTL、无关 A 记录过滤、共享地址保留最长 TTL、AAAA/HTTPS/SVCB 抑制、异常包、路由失败返回 SERVFAIL、停止清理及慢 TCP 中断。
+- C 模块使用 `-Wall -Wextra -Werror` 在本机和 Linux 编译通过；Linux 上 8 项 DNS 测试在 ASan/UBSan 下通过。
+- Linux 独立网络命名空间中真实 `ip rule` / 路由表验证通过：静态网段与 DNS 动态地址走 VPN，未命中走 WAN，本地 LAN 和 VPN 公网服务器保持原出口，全流量切换与断开清理正确。
+- 两模式 nftables 规则均通过 `nft -c`。真实 dnsmasq + DNS 模块 + nft 重定向联动通过：IPv4/IPv6 本机 DNS 进入代理，命中使用 VPN DNS，未命中透传原 dnsmasq，无 DNS 循环。
+- 新 LuCI 页面的四类规则同时显示；全流量隐藏规则，切回规则分流保留值；可操作预览和规则页截图已更新。
+- ShellCheck、JavaScript、JSON、YAML 和 shell 语法检查通过。
+
+以上验证不涉及宿主实际 VPN 或路由。尚需完整固件交叉编译与 RT-ACRH17 真机的 procd、PPP DNS、firewall4/LAN DNS、其他 DNS/策略路由插件兼容及长期运行验收。
+
+## 1.0.0：连接管理基础验证
+
 已完成：
 
 - 配置与输入边界测试 5 项：默认值、无效字段、凭据转义、权限、空路由。
