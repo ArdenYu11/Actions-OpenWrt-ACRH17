@@ -1,0 +1,13 @@
+{
+  "admin/vpn": {
+    "title": "VPN",
+    "order": 70,
+    "action": { "type": "firstchild" }
+  },
+  "admin/vpn/l2tp-ipsec-client": {
+    "title": "L2TP/IPsec 客户端",
+    "order": 10,
+    "action": { "type": "view", "path": "l2tp-ipsec-client" },
+    "depends": { "acl": [ "luci-app-l2tp-ipsec-client" ] }
+  }
+}

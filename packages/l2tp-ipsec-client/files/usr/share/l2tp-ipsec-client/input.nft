@@ -1,0 +1,1 @@
+meta nfproto ipv4 udp dport 1701 ipsec in reqid 41717 counter accept comment "Managed L2TP over IPsec"

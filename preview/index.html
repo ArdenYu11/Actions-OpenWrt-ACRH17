@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width,initial-scale=1">
+ <title>L2TP/IPsec 客户端 · 设置页预览</title>
+ <link rel="stylesheet" href="preview.css">
+</head>
+<body>
+ <header><strong>OpenWrt</strong><span>LuCI 管理界面</span><span class="device">RT-ACRH17</span></header>
+ <aside>
+  <div class="nav-label">路由器管理</div>
+  <div>状态</div><div>系统</div><div>网络</div>
+  <div class="nav-group">VPN</div><div class="nav-active">L2TP/IPsec 客户端</div>
+ </aside>
+ <main>
+  <div class="preview-bar"><div><strong>设置页预览</strong><span>所有操作使用演示数据，不会连接服务器。</span></div>
+   <label>演示状态 <select id="scenario"><option value="disconnected">未连接</option><option value="connected">已连接</option><option value="psk_error">PSK 错误</option><option value="ppp_error">账号认证失败</option><option value="probe_error">内网未响应</option></select></label>
+  </div>
+  <div id="notifications" aria-live="polite"></div>
+  <div id="app"></div>
+  <footer>此预览复用插件的实际页面代码；刷机后的外观会随 LuCI 主题变化。</footer>
+ </main>
+ <script src="preview.js"></script>
+</body>
+</html>

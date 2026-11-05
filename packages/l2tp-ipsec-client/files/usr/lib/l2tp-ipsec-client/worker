@@ -1,0 +1,136 @@
+#!/bin/sh
+
+umask 077
+. /usr/lib/l2tp-ipsec-client/common.sh
+mkdir -p "$LP_DIR"
+chmod 700 "$LP_DIR"
+mkdir "$LP_DIR/lock" 2>/dev/null || exit 1
+printf '%s\n' "$$" > "$LP_DIR/worker.pid"
+
+cleanup_attempt() {
+	lp_stop_pid "${command_pid:-}"
+	# 先结束 PPP 和 L2TP，再撤销 IPsec；阻断策略最后移除。
+	if [ -f "$LP_DIR/ppp.pid" ]; then
+		read -r ppp_pid < "$LP_DIR/ppp.pid"
+		case "$ppp_pid" in ''|*[!0-9]*) ;; *)
+			if [ "$(cat "/proc/$ppp_pid/comm" 2>/dev/null)" = pppd ]; then
+				lp_stop_pid "$ppp_pid"
+			fi
+		;; esac
+	fi
+	lp_stop_pid "${l2tp_pid:-}"
+	[ -S "$LP_DIR/charon.vici" ] && lp_swan --terminate --ike "$LP_CONN" --timeout 2 >/dev/null 2>&1
+	lp_stop_pid "${charon_pid:-}"
+	"$LP_LIB/ppp-hook" down >/dev/null 2>&1
+	if [ "${block_added:-0}" = 1 ]; then
+		ip xfrm policy delete dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 2>/dev/null
+	fi
+	if [ "${host_added:-0}" = 1 ]; then
+		ip -4 route del "$server_ip/32" metric 41717 2>/dev/null
+	fi
+	rm -f "$LP_DIR/ppp.pid" "$LP_DIR/ppp.up" "$LP_DIR/l2tp-control" "$LP_DIR/xl2tpd.pid" "$LP_DIR/charon.vici"
+	rm -f "$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options"
+	l2tp_pid=""; charon_pid=""; block_added=0; host_added=0
+}
+
+finish() {
+	trap '' TERM INT
+	cleanup_attempt
+	lp_state disconnected '连接已断开。'
+	rm -f "$LP_DIR/worker.pid"
+	rmdir "$LP_DIR/lock" 2>/dev/null
+	exit 0
+}
+trap finish TERM INT
+trap 'rm -f "$LP_DIR/worker.pid"; rmdir "$LP_DIR/lock" 2>/dev/null' EXIT
+
+attempt() {
+	lp_state resolving '正在解析服务器地址。'
+	server_ip=$(resolveip -4 -t 5 "$server" 2>/dev/null | head -n 1)
+	lp_ip4 "$server_ip" || { lp_state error '服务器地址解析失败，请检查域名和 WAN DNS。'; return 1; }
+	# 单独管理 charon，检测其他实例后给出提示，避免争用 IKE 端口。
+	if pidof charon charon-systemd starter xl2tpd >/dev/null 2>&1; then
+		lp_state conflict '检测到其他 IPsec 或 L2TP 进程，请先停用其连接后重试。'
+		return 2
+	fi
+	local route_line gateway wan_dev
+	route_line=$(ip -4 route get "$server_ip" 2>/dev/null | head -n 1)
+	wan_dev=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
+	gateway=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
+	local_ip=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')
+	[ -n "$wan_dev" ] && [ "$wan_dev" != "$LP_IFACE" ] && lp_ip4 "$local_ip" || {
+		lp_state error '未找到可用的 WAN 出口，请先确认路由器能正常上网。'; return 1;
+	}
+	if [ -z "$(ip -4 route show table main exact "$server_ip/32")" ]; then
+		if [ -n "$gateway" ]; then
+			ip -4 route add "$server_ip/32" via "$gateway" dev "$wan_dev" metric 41717 || return 1
+		else
+			ip -4 route add "$server_ip/32" dev "$wan_dev" metric 41717 || return 1
+		fi
+		host_added=1
+	fi
+	# 无 CHILD_SA 时阻止 UDP/1701 裸发；IPsec 建立后的精确策略优先。
+	ip xfrm policy add dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 action block priority 424242 || {
+		lp_state error '无法安装 L2TP 保护策略，请检查内核 IPsec 模块。'; return 1;
+	}
+	block_added=1
+	lp_render || { lp_state error '无法生成运行配置。'; return 1; }
+	: > "$LP_DIR/charon.log"
+	STRONGSWAN_CONF="$LP_DIR/strongswan.conf" /usr/lib/ipsec/charon >/dev/null 2>&1 &
+	charon_pid=$!
+	local count=0
+	while [ ! -S "$LP_DIR/charon.vici" ] && [ "$count" -lt 10 ]; do
+		lp_alive "$charon_pid" || break
+		lp_sleep 1; count=$((count + 1))
+	done
+	[ -S "$LP_DIR/charon.vici" ] || { lp_state error 'IPsec 进程启动失败，请检查依赖包。'; return 1; }
+	lp_swan --load-all --file "$LP_DIR/swanctl.conf" >/dev/null 2>&1 || {
+		lp_state error 'IPsec 配置加载失败，请检查算法与身份标识。'; return 1;
+	}
+	lp_state ipsec '正在建立 IPsec 加密连接。'
+	lp_wait_command swanctl --initiate --child "$LP_CONN" --timeout 25 --uri "$LP_URI" >/dev/null 2>&1
+	lp_has_ipsec || { lp_state error 'IPsec 协商失败，请检查 PSK、身份标识和加密算法。'; return 1; }
+	lp_state ppp 'IPsec 已建立，正在验证账号并连接 PPP。'
+	xl2tpd -D -c "$LP_DIR/xl2tpd.conf" -C "$LP_DIR/l2tp-control" -p "$LP_DIR/xl2tpd.pid" >/dev/null 2>&1 &
+	l2tp_pid=$!
+	count=0
+	while [ ! -p "$LP_DIR/l2tp-control" ] && [ "$count" -lt 5 ]; do
+		lp_sleep 1; count=$((count + 1))
+	done
+	[ -p "$LP_DIR/l2tp-control" ] || { lp_state error 'L2TP 进程启动失败。'; return 1; }
+	# FIFO 使用非阻塞打开，防止子进程退出后工作进程卡住。
+	lp_wait_command xl2tpd-control -c "$LP_DIR/l2tp-control" connect-lac "$LP_CONN" >/dev/null 2>&1 || {
+		lp_state error 'L2TP 拨号失败。'; return 1;
+	}
+	count=0
+	while [ ! -f "$LP_DIR/ppp.up" ] && [ "$count" -lt 30 ]; do
+		lp_alive "$l2tp_pid" && lp_has_ipsec || break
+		lp_sleep 1; count=$((count + 1))
+	done
+	[ -f "$LP_DIR/ppp.up" ] || { lp_state error 'PPP 连接失败，请检查账号密码、PAP 设置和 UDP 1701 连通性。'; return 1; }
+	if [ -f "$LP_DIR/route.error" ]; then
+		lp_state error 'PPP 已连接，但内网路由设置失败；连接已停止，请检查网段冲突。'
+		return 2
+	fi
+	lp_state connected 'VPN 已连接，指定内网路由已生效。'
+	while lp_alive "$charon_pid" && lp_alive "$l2tp_pid" && [ -f "$LP_DIR/ppp.up" ] && lp_has_ipsec; do
+		lp_sleep 5
+	done
+	lp_state error '连接中断。'
+	return 1
+}
+
+lp_load
+if ! lp_validate; then
+	lp_state error "$LP_ERROR"
+	exit 1
+fi
+while :; do
+	attempt
+	result=$?
+	cleanup_attempt
+	[ "$result" = 2 ] && exit 1
+	[ "$reconnect" = 1 ] || exit 1
+	lp_state retrying "连接未成功或已中断，${retry_interval} 秒后自动重试。"
+	lp_sleep "$retry_interval"
+done

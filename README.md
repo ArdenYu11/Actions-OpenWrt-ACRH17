@@ -21,6 +21,8 @@ Actions → **Build RT-ACRH17 (lede)** → Run workflow。首次编译约 2–3 
 
 lede 里 RT-ACRH17 和 RT-AC42U 共用 `asus_rt-ac42u` 定义，所以固件文件名里是 `asus_rt-ac42u`。
 
+已集成可独立维护的 L2TP/IPsec 客户端插件，在「VPN → L2TP/IPsec 客户端」统一填写服务器、账号密码和 PSK。通过一个编译配置项自动带入依赖，配置和预览方法见 [插件说明](packages/README.md)。
+
 硬件是 IPQ4019 + 256 MB 内存 + 128 MB NAND，Docker、AdGuardHome 这类重型插件跑起来会很吃力，插件别贪多。
 
 ## 软件源与内核模块

@@ -1,0 +1,13 @@
+{
+  "luci-app-l2tp-ipsec-client": {
+    "description": "管理 L2TP/IPsec 客户端",
+    "read": {
+      "uci": [ "l2tpipsec" ],
+      "ubus": { "l2tp-ipsec-client": [ "status", "logs" ] }
+    },
+    "write": {
+      "uci": [ "l2tpipsec" ],
+      "ubus": { "l2tp-ipsec-client": [ "start", "stop", "validate" ] }
+    }
+  }
+}
