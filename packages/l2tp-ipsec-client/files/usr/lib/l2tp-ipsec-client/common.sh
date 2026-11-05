@@ -24,10 +24,20 @@ lp_load() {
 	config_get lcp_failure main lcp_failure 5
 	config_get retry_interval main retry_interval 30
 	config_get probe_ip main probe_ip
+	config_get routing_mode main routing_mode rules
+	config_get vpn_dns main vpn_dns
 	config_get_bool reconnect main reconnect 1
 	routes=""
 	config_list_foreach main routes lp_add_route
+	domains=""; domain_prefixes=""; domain_suffixes=""
+	config_list_foreach main domains lp_add_domain
+	config_list_foreach main domain_prefixes lp_add_prefix
+	config_list_foreach main domain_suffixes lp_add_suffix
 }
+
+lp_add_domain() { domains="${domains:+$domains }$1"; }
+lp_add_prefix() { domain_prefixes="${domain_prefixes:+$domain_prefixes }$1"; }
+lp_add_suffix() { domain_suffixes="${domain_suffixes:+$domain_suffixes }$1"; }
 
 lp_add_route() {
 	routes="${routes:+$routes }$1"
@@ -70,11 +80,27 @@ lp_validate() {
 	lp_number "$lcp_interval" 5 300 || { lp_error '保活间隔必须介于 5 和 300 秒。'; return 1; }
 	lp_number "$lcp_failure" 1 20 || { lp_error '保活失败次数必须介于 1 和 20。'; return 1; }
 	lp_number "$retry_interval" 10 300 || { lp_error '重连间隔必须介于 10 和 300 秒。'; return 1; }
+	case "${routing_mode:-rules}" in full|rules) ;; *) lp_error '路由模式无效。'; return 1 ;; esac
+	local rule_count=0
+	for value in ${domains:-} ${domain_prefixes:-} ${domain_suffixes:-}; do rule_count=$((rule_count + 1)); done
+	[ "$rule_count" -le 512 ] || { lp_error '域名规则总数不能超过 512 条。'; return 1; }
 	for route in $routes; do
 		case "$route" in */*) ;; *) lp_error '内网路由必须使用 IPv4 CIDR 格式。'; return 1 ;; esac
-		lp_ip4 "${route%/*}" && lp_number "${route##*/}" 1 32 || { lp_error '内网路由无效；暂不支持默认路由 0.0.0.0/0。'; return 1; }
+		lp_ip4 "${route%/*}" && lp_number "${route##*/}" 1 32 || { lp_error '网段无效；全流量请选择全流量模式。'; return 1; }
 	done
+	for value in ${domains:-} ${domain_suffixes:-}; do
+		lp_domain "$value" || { lp_error '域名或后缀无效，请填写不带协议、端口和通配符的域名。'; return 1; }
+	done
+	for value in ${domain_prefixes:-}; do
+		lp_domain "${value%.}" || { lp_error '域名前缀无效，例如 api. 或 internal-。'; return 1; }
+	done
+	[ -z "${vpn_dns:-}" ] || lp_ip4 "$vpn_dns" || { lp_error 'VPN DNS 必须是 IPv4 地址。'; return 1; }
 	[ -z "$probe_ip" ] || lp_ip4 "$probe_ip" || { lp_error '探测地址必须是 IPv4 地址。'; return 1; }
+}
+
+lp_domain() {
+	[ "${#1}" -le 253 ] && printf '%s\n' "$1" | LC_ALL=C awk -F. '
+ {for(i=1;i<=NF;i++) if(length($i)<1 || length($i)>63 || $i !~ /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/) exit 1}'
 }
 
 lp_quote() {
@@ -89,6 +115,7 @@ lp_state() {
 	json_add_string server "$server"
 	json_add_string server_ip "${server_ip:-}"
 	json_add_string interface "$LP_IFACE"
+	json_add_string routing_mode "${routing_mode:-rules}"
 	json_add_int updated "$(date +%s)"
 	json_dump > "$LP_DIR/status.new"
 	mv "$LP_DIR/status.new" "$LP_DIR/status.json"
@@ -179,6 +206,7 @@ refuse-mschap-v2
 noccp
 noipdefault
 nodefaultroute
+usepeerdns
 ipcp-accept-local
 ipcp-accept-remote
 mtu $mtu
@@ -201,7 +229,16 @@ length bit = yes
 autodial = no
 redial = no
 EOF
+	printf '%s\n' "$server_ip" > "$LP_DIR/server-ip"
 	printf '%s\n' $routes > "$LP_DIR/routes"
+	printf '%s\n' "${routing_mode:-rules}" > "$LP_DIR/routing-mode"
+	printf '%s\n' "${vpn_dns:-}" > "$LP_DIR/configured-dns"
+	: > "$LP_DIR/domain-rules"
+	if [ "${routing_mode:-rules}" = rules ]; then
+		for value in ${domains:-}; do printf 'exact %s\n' "$value"; done >> "$LP_DIR/domain-rules"
+		for value in ${domain_prefixes:-}; do printf 'prefix %s\n' "$value"; done >> "$LP_DIR/domain-rules"
+		for value in ${domain_suffixes:-}; do printf 'suffix %s\n' "$value"; done >> "$LP_DIR/domain-rules"
+	fi
 }
 
 lp_has_ipsec() {

@@ -74,6 +74,7 @@ call)
 		address=$(ip -4 -o address show dev l2tp-vpn 2>/dev/null | awk '{print $4}')
 		json_add_string address "$address"
 		json_add_string probe_ip "$probe_ip"
+		json_add_string routing_mode "${routing_mode:-rules}"
 		reachable=unknown
 		if [ "$phase" = connected ] && [ "$ipsec" = 1 ] && [ "$ppp" = 1 ] && [ -n "$probe_ip" ]; then
 			if ip -4 route get "$probe_ip" 2>/dev/null | grep -q 'dev l2tp-vpn '; then
@@ -93,6 +94,10 @@ IPsec 诊断：远端拒绝认证（AUTHENTICATION_FAILED）。"
 IPsec 诊断：双方加密算法不匹配（NO_PROPOSAL_CHOSEN）。"
 			grep -q 'giving up after' "$LP_DIR/charon.log" && log="$log
 IPsec 诊断：服务器未响应，请检查地址、防火墙和 UDP 500/4500。"
+		fi
+		if [ -s "$LP_DIR/dns.log" ]; then
+			log="$log
+$(tail -n 10 "$LP_DIR/dns.log")"
 		fi
 		json_init; json_add_string log "${log:-暂无连接日志。}"; json_dump
 	;;
