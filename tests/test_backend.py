@@ -20,7 +20,7 @@ class BackendTests(unittest.TestCase):
             'ike': 'aes256-sha256-modp2048', 'esp': 'aes256-sha1',
             'local_id': '', 'remote_id': '', 'mtu': '1400',
             'lcp_interval': '30', 'lcp_failure': '5',
-            'retry_interval': '30', 'probe_ip': '10.20.0.10',
+            'retry_interval': '30', 'retry_max_attempts': '0', 'probe_ip': '10.20.0.10',
             'routes': '10.20.0.0/16 10.30.0.7/32',
             'routing_mode': 'rules', 'vpn_dns': '', 'domains': '', 'domain_prefixes': '', 'domain_suffixes': '',
             'server_ip': '192.0.2.20', 'local_ip': '192.0.2.10',
@@ -37,13 +37,14 @@ class BackendTests(unittest.TestCase):
 
     def test_rejects_invalid_config(self):
         cases = {
-            'server': ['https://vpn.example.com', 'x;touch /tmp/injected', '', 'bad\nhost'],
+            'server': ['https://vpn.example.com', 'x;touch /tmp/injected', '', 'bad\nhost', '10.20.0.1\n10.20.0.2'],
             'password': ['', 'pw\nrefuse-pap'],
             'psk': ['', 'pw\nconnections { evil {} }'],
             'ike': ['aes256-sha256-modp2048\nversion = 2', 'unknown'],
             'routes': ['0.0.0.0/0', '10.0.0.0/33', '999.1.2.3/16', '10.0.0.0;touch /tmp/x'],
             'mtu': ['0', '1461', '1;exit', '999999999999999999'],
-            'probe_ip': ['not-an-ip', '256.0.0.1'],
+            'probe_ip': ['https://example.com', '256.0.0.1', '-option', 'a;touch /tmp/x', 'host:80', 'bad\nhost', '10.20.0.1\n10.20.0.2'],
+            'retry_interval': ['0', '3601', '1;exit'], 'retry_max_attempts': ['-1', '10001', 'foo'],
             'routing_mode': ['unknown'], 'vpn_dns': ['bad', '256.0.0.1'],
             'domains': ['https://example.com', '*.example.com', 'example.com/path', '.example.com'],
             'domain_prefixes': ['api..', '*.'], 'domain_suffixes': ['com.', 'foo..com'],
@@ -98,6 +99,11 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((target / 'routing-mode').read_text().strip(), 'full')
             self.assertEqual((target / 'domain-rules').read_text(), '')
+
+    def test_probe_supports_ip_and_domain(self):
+        for value in ['10.20.0.10', 'intranet.example.com', 'localhost', 'internal-app.example.org']:
+            with self.subTest(value=value):
+                self.assertEqual(self.run_shell(f'probe_ip={shlex.quote(value)}\nlp_validate').returncode, 0)
 
     def test_domain_rule_limit(self):
         value = ' '.join('example.com' for _ in range(513))

@@ -23,6 +23,7 @@ lp_load() {
 	config_get lcp_interval main lcp_interval 30
 	config_get lcp_failure main lcp_failure 5
 	config_get retry_interval main retry_interval 30
+	config_get retry_max_attempts main retry_max_attempts 0
 	config_get probe_ip main probe_ip
 	config_get routing_mode main routing_mode rules
 	config_get vpn_dns main vpn_dns
@@ -54,6 +55,7 @@ lp_number() {
 }
 
 lp_ip4() {
+	case "$1" in ''|*[!0-9.]*) return 1 ;; esac
 	printf '%s\n' "$1" | awk -F. 'NF != 4 {exit 1} {for(i=1;i<=4;i++) if($i !~ /^[0-9]+$/ || length($i)>3 || $i+0>255) exit 1}'
 }
 
@@ -79,7 +81,8 @@ lp_validate() {
 	lp_number "$mtu" 576 1460 || { lp_error 'MTU 必须介于 576 和 1460。'; return 1; }
 	lp_number "$lcp_interval" 5 300 || { lp_error '保活间隔必须介于 5 和 300 秒。'; return 1; }
 	lp_number "$lcp_failure" 1 20 || { lp_error '保活失败次数必须介于 1 和 20。'; return 1; }
-	lp_number "$retry_interval" 10 300 || { lp_error '重连间隔必须介于 10 和 300 秒。'; return 1; }
+	lp_number "$retry_interval" 1 3600 || { lp_error '最大重连间隔必须介于 1 和 3600 秒。'; return 1; }
+	lp_number "${retry_max_attempts:-0}" 0 10000 || { lp_error '最大重连次数必须介于 0 和 10000；0 表示不限次数。'; return 1; }
 	case "${routing_mode:-rules}" in full|rules) ;; *) lp_error '路由模式无效。'; return 1 ;; esac
 	local rule_count=0
 	for value in ${domains:-} ${domain_prefixes:-} ${domain_suffixes:-}; do rule_count=$((rule_count + 1)); done
@@ -95,10 +98,11 @@ lp_validate() {
 		lp_domain "${value%.}" || { lp_error '域名前缀无效，例如 api. 或 internal-。'; return 1; }
 	done
 	[ -z "${vpn_dns:-}" ] || lp_ip4 "$vpn_dns" || { lp_error 'VPN DNS 必须是 IPv4 地址。'; return 1; }
-	[ -z "$probe_ip" ] || lp_ip4 "$probe_ip" || { lp_error '探测地址必须是 IPv4 地址。'; return 1; }
+	[ -z "$probe_ip" ] || lp_probe_target "$probe_ip" || { lp_error '探测地址必须是 IPv4 地址或域名，不包含协议和端口。'; return 1; }
 }
 
 lp_domain() {
+	case "$1" in ''|*[!a-zA-Z0-9_.-]*) return 1 ;; esac
 	[ "${#1}" -le 253 ] && printf '%s\n' "$1" | LC_ALL=C awk -F. '
  {for(i=1;i<=NF;i++) if(length($i)<1 || length($i)>63 || $i !~ /^[a-zA-Z0-9_][a-zA-Z0-9_-]*$/) exit 1}'
 }
@@ -275,4 +279,54 @@ lp_wait_command() {
 
 lp_sleep() {
 	lp_wait_command sleep "$1"
+}
+
+
+lp_probe_target() {
+ lp_ip4 "$1" && return 0
+ case "$1" in ''|*[!0-9.]*) ;; *) return 1 ;; esac
+ lp_domain "$1"
+}
+
+lp_probe() {
+ LP_PROBE_REACH=unknown; LP_PROBE_ADDRESS=""
+ [ -n "$probe_ip" ] || return 0
+ lp_probe_target "$probe_ip" || { LP_PROBE_REACH=resolve_failed; return 0; }
+ local addresses address routed=0
+ if lp_ip4 "$probe_ip"; then addresses=$probe_ip
+ else
+  addresses=$(resolveip -4 -t 3 "$probe_ip" 2>/dev/null | head -n 3)
+  [ -n "$addresses" ] || { LP_PROBE_REACH=resolve_failed; return 0; }
+ fi
+ LP_PROBE_REACH=no_route
+ for address in $addresses; do
+  lp_ip4 "$address" || continue
+  [ -n "$LP_PROBE_ADDRESS" ] || LP_PROBE_ADDRESS=$address
+  if ip -4 route get "$address" 2>/dev/null | grep -Eq 'dev l2tp-vpn( |$)'; then
+   routed=1; LP_PROBE_ADDRESS=$address
+   if ping -I l2tp-vpn -c 1 -W 1 "$address" >/dev/null 2>&1; then LP_PROBE_REACH=yes; return 0; fi
+  fi
+ done
+ [ "$routed" = 0 ] || LP_PROBE_REACH=no
+ [ -n "$LP_PROBE_ADDRESS" ] || LP_PROBE_REACH=resolve_failed
+ return 0
+}
+
+lp_retry_reset() {
+ retry_interval=$(printf '%s\n' "$retry_interval" | awk '{printf "%d", $1}')
+ retry_max_attempts=$(printf '%s\n' "${retry_max_attempts:-0}" | awk '{printf "%d", $1}')
+ retry_attempt=0; retry_delay=1; retry_previous=1; retry_wait=0
+}
+
+lp_retry_plan() {
+ [ "${retry_max_attempts:-0}" = 0 ] || [ "$retry_attempt" -lt "$retry_max_attempts" ] || return 1
+ retry_attempt=$((retry_attempt + 1)); retry_wait=$retry_delay
+ if [ "$retry_delay" -ge "$retry_interval" ]; then
+  retry_delay=1; retry_previous=1
+ else
+  local next=$((retry_previous + retry_delay))
+  [ "$next" -le "$retry_interval" ] || next=$retry_interval
+  retry_previous=$retry_delay; retry_delay=$next
+ fi
+ return 0
 }

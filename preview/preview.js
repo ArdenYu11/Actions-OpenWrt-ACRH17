@@ -18,17 +18,34 @@ function E(tag, attrs, children) {
 const config = {
  server: '', username: '', password: '', psk: '', enabled: '0', reconnect: '1',
  routing_mode: 'rules', vpn_dns: '', domains: [], domain_prefixes: [], domain_suffixes: [], routes: [], probe_ip: '', ike: 'aes256-sha256-modp2048', esp: 'aes256-sha1',
- local_id: '', remote_id: '', mtu: '1400', lcp_interval: '30', lcp_failure: '5', retry_interval: '30'
+ local_id: '', remote_id: '', mtu: '1400', lcp_interval: '30', lcp_failure: '5', retry_interval: '30', retry_max_attempts: '0'
 };
 let scenario = 'disconnected';
 let sequence = 0;
 let state = { phase: 'disconnected', message: '尚未连接。', running: false, ipsec: false, ppp: false };
 let log = '暂无连接日志。';
 let currentView;
-const uci = { load: async () => config, apply: async () => 0 };
+const uci = { load: async () => config, apply: async () => 0, get: (name,section,key)=>config[key], set:(name,section,key,value)=>{config[key]=value;}, unset:(name,section,key)=>{delete config[key];} };
 const view = { extend: definition => definition };
 const poll = { add: callback => setInterval(callback, 1000) };
 const ui = {
+ showModal: (title,children,...classes) => {
+  ui.hideModal();
+  const backdrop=E('div',{class:'lp-modal-backdrop'});
+  const modal=E('div',{class:'lp-preview-modal '+classes.join(' '),role:'dialog','aria-modal':'true','aria-label':title},[E('h3',{},title),children]);
+  backdrop.append(modal);document.body.append(backdrop);
+  backdrop.addEventListener('keydown',event=>{
+   if(event.key==='Escape')ui.hideModal();
+   if(event.key==='Tab') {
+    const focusable=[...modal.querySelectorAll('input,select,button')].filter(el=>!el.closest('[hidden]'));
+    const index=focusable.indexOf(document.activeElement);
+    if(event.shiftKey&&index===0){event.preventDefault();focusable.at(-1).focus();}
+    else if(!event.shiftKey&&index===focusable.length-1){event.preventDefault();focusable[0].focus();}
+   }
+  });
+  return modal;
+ },
+ hideModal: () => document.querySelector('.lp-modal-backdrop')?.remove(),
  createHandlerFn: (self, fn) => async event => {
   const button = event.currentTarget;
   button.disabled = true;
@@ -97,7 +114,8 @@ class Option {
  render() {
   this.field = E('div', {class:'cbi-value-field'});
   const value = config[this.key] ?? this.default ?? '';
-  if (this.type === 'DummyValue') this.field.append(E('div', {class:'cbi-dummy'}, this.cfgvalue()));
+  if (this.renderWidget) this.field.append(this.renderWidget('main'));
+  else if (this.type === 'DummyValue') this.field.append(E('div', {class:'cbi-dummy'}, this.cfgvalue()));
   else if (this.type === 'DynamicList') {
    this.rows = E('div');
    const add = text => {
@@ -181,6 +199,7 @@ class FormMap {
  async save() {
   const updated={};let firstError;
   for(const option of this.sectionObj.options){
+   if(option.parse){await option.parse('main');continue;}
    const value=option.read();if(value===undefined)continue;
    const result=option.node.hidden ? true : option.check(value);
    if(result!==true)firstError=firstError||result;

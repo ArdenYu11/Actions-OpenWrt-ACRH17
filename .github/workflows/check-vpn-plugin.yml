@@ -27,6 +27,8 @@ jobs:
       - name: Check generated configuration and worker lifecycle
         run: |
           python3 tests/test_backend.py
+          python3 tests/test_retry_probe.py
+          node tests/test_ui_rules.js
           python3 tests/test_domain_dns.py
           python3 tests/test_routing.py
           python3 tests/test_linux_integration.py
