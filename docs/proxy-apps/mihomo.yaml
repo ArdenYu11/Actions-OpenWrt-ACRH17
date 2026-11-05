@@ -1,0 +1,20 @@
+# Clash / mihomo：与路由器 VPN 域名分流共存所需的配置片段
+# 用法：把占位符换成实际值，再合并到现有配置的同名段落里，不要整段覆盖。说明见同目录 README.md
+
+dns:
+  # 内网域名不用虚假 IP
+  fake-ip-filter:
+    - '+.<内网域名后缀>'
+  # 内网域名交给路由器解析，路由器才能把解析出的地址加到 VPN 路由
+  nameserver-policy:
+    '+.<内网域名后缀>': '<路由器地址>'
+
+rules:
+  # 放在其他规则前面
+  - DOMAIN-SUFFIX,<内网域名后缀>,DIRECT
+  - IP-CIDR,<内网网段>,DIRECT,no-resolve
+
+tun:
+  # 可选：内网网段不进 TUN，直接走系统路由（需要较新版本的 mihomo）
+  route-exclude-address:
+    - <内网网段>
