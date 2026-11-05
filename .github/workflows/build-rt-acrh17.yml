@@ -5,6 +5,19 @@ name: Build RT-ACRH17 (lede)
 
 on:
   workflow_dispatch:
+    inputs:
+      release:
+        description: '编译成功后发布 Release'
+        type: boolean
+        required: false
+        default: false
+      lede_version:
+        description: 'lede 源码版本：pinned 用 lede.lock/feeds.lock 固定的版本，latest 拉最新代码（用于试升级）'
+        type: choice
+        options:
+          - pinned
+          - latest
+        default: pinned
 
 permissions:
   contents: write
@@ -55,10 +68,27 @@ jobs:
 
       - name: Clone lede source
         working-directory: /workdir
+        env:
+          LEDE_VERSION: ${{ inputs.lede_version || 'pinned' }}
         run: |
-          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          if [ "$LEDE_VERSION" = pinned ]; then
+            pin=$(grep -Ev '^[[:space:]]*(#|$)' "$GITHUB_WORKSPACE/lede.lock" | head -n 1)
+            if ! printf '%s' "$pin" | grep -Eqx '[0-9a-f]{40}'; then
+              echo "::error::lede.lock 里需要一个完整的 40 位提交 SHA"
+              exit 1
+            fi
+            git init -q openwrt
+            git -C openwrt remote add origin "$REPO_URL"
+            git -C openwrt fetch -q --depth 1 origin "$pin"
+            git -C openwrt checkout -q FETCH_HEAD
+            # feeds 也要固定：strongswan、xl2tpd、LuCI 都来自 feeds，不随 lede 提交走
+            cp "$GITHUB_WORKSPACE/feeds.lock" openwrt/feeds.conf.default
+          else
+            git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+          fi
           ln -sf /workdir/openwrt "$GITHUB_WORKSPACE/openwrt"
           echo "LEDE_COMMIT=$(git -C openwrt log -1 --format='%h (%cd)' --date=short)" >> "$GITHUB_ENV"
+          echo "LEDE_VERSION=$LEDE_VERSION" >> "$GITHUB_ENV"
 
       - name: Run diy-part1.sh
         run: |
@@ -116,6 +146,18 @@ jobs:
         run: |
           cd openwrt/bin/targets/*/*
           rm -rf packages
+          # 记下这次实际用到的源码版本；固件验证没问题后，把这两个文件拷回仓库就能固定到这个版本
+          src="$GITHUB_WORKSPACE/openwrt"
+          {
+            echo "# 来自编译 $BUILD_DATE（$LEDE_VERSION），lede $LEDE_COMMIT"
+            git -C "$src" rev-parse HEAD
+          } > lede.lock
+          {
+            echo "# 来自编译 $BUILD_DATE（$LEDE_VERSION）"
+            grep -E '^src-git[[:space:]]' "$src/feeds.conf.default" | while read -r type name url; do
+              printf '%s %s %s^%s\n' "$type" "$name" "${url%%[;^]*}" "$(git -C "$src/feeds/$name" rev-parse HEAD)"
+            done
+          } > feeds.lock
           ls -lh
           echo "FIRMWARE=$PWD" >> "$GITHUB_ENV"
 
@@ -125,14 +167,15 @@ jobs:
           name: RT-ACRH17-${{ env.BUILD_DATE }}
           path: ${{ env.FIRMWARE }}
 
-      # 编译成功就发布，不用每次勾选
+      # 仅在手动开启发布选项且编译成功时发布。
       - name: Publish release
+        if: ${{ success() && inputs.release }}
         uses: softprops/action-gh-release@v3
         with:
           tag_name: rt-acrh17-${{ env.BUILD_DATE }}
           name: RT-ACRH17 ${{ env.BUILD_DATE }}
           body: |
-            - 源码：coolsnowwolf/lede ${{ env.LEDE_COMMIT }}
+            - 源码：coolsnowwolf/lede ${{ env.LEDE_COMMIT }}（${{ env.LEDE_VERSION == 'pinned' && '固定版本' || '最新代码' }}），feeds 版本见附件 `feeds.lock`
             - 默认后台：http://192.168.1.1 ，用户 root，密码 password
             - 刷机用 `squashfs-sysupgrade.bin`，从原厂固件首次刷入的步骤见仓库 README
           files: ${{ env.FIRMWARE }}/*
