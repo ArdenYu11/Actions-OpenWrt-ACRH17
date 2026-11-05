@@ -117,7 +117,7 @@ class DomainDnsTests(unittest.TestCase):
         self.local.close()
         self.tmp.cleanup()
 
-    def start(self, mode='rules', fail=False):
+    def start(self, mode='rules', fail=False, extra=()):
         rules = self.dir / 'rules'
         rules.write_text('exact exact.example.com\nprefix api.\nprefix internal-\nsuffix example.org\n')
         with socket.socket() as sock:
@@ -126,7 +126,7 @@ class DomainDnsTests(unittest.TestCase):
         ready = self.dir / 'ready'
         args = [str(self.binary), '--rules', str(rules), '--vpn-dns', '127.0.0.1', '--vpn-port', str(self.vpn.port),
                 '--local-dns', '127.0.0.1', '--local-port', str(self.local.port), '--mode', mode,
-                '--port', str(self.port), '--ip-tool', str(self.ip), '--ready', str(ready)]
+                '--port', str(self.port), '--ip-tool', str(self.ip), '--ready', str(ready), *extra]
         self.process = subprocess.Popen(args, env={**os.environ, 'TEST_ROUTE_TRACE': str(self.trace), 'TEST_ROUTE_FAIL': str(int(fail))},
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.monotonic() + 3
@@ -199,10 +199,36 @@ class DomainDnsTests(unittest.TestCase):
         trace = self.trace.read_text()
         self.assertIn('replace 10.20.2.3', trace)
         self.assertNotIn('10.99.2.3', trace)
-        deadline = time.monotonic() + 5
-        while 'del 10.20.2.3' not in self.trace.read_text() and time.monotonic() < deadline:
-            time.sleep(.1)
+        # TTL 到期后路由仍保留，长连接不会被切断；退出时统一删除
+        time.sleep(3.5)
+        self.assertNotIn('del 10.20.2.3', self.trace.read_text())
+        self.process.terminate()
+        self.process.communicate(timeout=5)
+        self.process = None
         self.assertIn('del 10.20.2.3', self.trace.read_text())
+
+    def test_full_table_reuses_only_expired_addresses(self):
+        addresses = {'api.one.net': '10.20.3.1', 'api.two.net': '10.20.3.2', 'api.three.net': '10.20.3.3'}
+        ttls = {'api.one.net': 1, 'api.two.net': 60, 'api.three.net': 60}
+        def reply(data):
+            name = '.'.join(part.decode() for part in self.labels(data[12:]))
+            return DnsServer.answer(data, addresses[name], ttls[name])
+        self.vpn.handler = reply
+        self.start(extra=('--max-routes', '1'))
+        self.assertEqual(self.ask('api.one.net')[-4:], socket.inet_aton('10.20.3.1'))
+        time.sleep(3.5)
+        self.assertEqual(self.ask('api.two.net')[-4:], socket.inet_aton('10.20.3.2'))
+        trace = self.trace.read_text()
+        self.assertIn('del 10.20.3.1', trace)
+        self.assertIn('replace 10.20.3.2', trace)
+        self.assertEqual(self.ask('api.three.net')[3] & 15, 2)
+        self.assertNotIn('del 10.20.3.2', self.trace.read_text())
+
+    @staticmethod
+    def labels(data):
+        while data[0]:
+            yield data[1:1 + data[0]]
+            data = data[1 + data[0]:]
 
     def test_malformed_queries_and_slow_tcp_do_not_block_shutdown(self):
         self.start()
@@ -222,6 +248,12 @@ class DomainDnsTests(unittest.TestCase):
             self.process.terminate()
             self.process.communicate(timeout=5)
             self.assertLess(time.monotonic() - started, 4)
+
+    def test_invalid_route_limit_is_rejected(self):
+        for value in ('0', '4097', 'x'):
+            result = subprocess.run([str(self.binary), '--rules', '/dev/null', '--vpn-dns', '127.0.0.1', '--max-routes', value],
+                                    capture_output=True)
+            self.assertEqual(result.returncode, 2)
 
     def test_shutdown_cleans_and_shared_ip_uses_longest_ttl(self):
         self.start()

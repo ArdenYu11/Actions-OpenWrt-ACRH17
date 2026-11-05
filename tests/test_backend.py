@@ -72,6 +72,8 @@ class BackendTests(unittest.TestCase):
             self.assertIn('version = 1', swan)
             self.assertIn('remote_ts = 192.0.2.20/32[udp/1701]', swan)
             self.assertIn('nodefaultroute', ppp)
+            # 3 秒重发一次，30 次约 90 秒，给手机确认留出时间
+            self.assertIn('pap-max-authreq 30', ppp)
             self.assertIn('usepeerdns', ppp)
             for option in ['refuse-eap', 'refuse-chap', 'refuse-mschap', 'refuse-mschap-v2']:
                 self.assertIn(option, ppp)

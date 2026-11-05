@@ -22,6 +22,39 @@ routing_down() {
 	rm -f "$LP_DIR/dns.pid" "$LP_DIR/dns.ready" "$LP_DIR/routing-owned" "$LP_DIR/active-dns" "$LP_DIR/dns-owned"
 }
 
+# 连接前清理：不看归属标记，直接删掉本插件专用的规则优先级、路由表和 nft 表。
+# 上次异常退出时标记文件可能已经丢了，但这些编号和表名只有本插件使用。
+routing_purge() {
+	routing_down
+	for priority in 10100 10101 10102 10103 10104; do
+		while ip -4 rule del priority "$priority" 2>/dev/null; do :; done
+	done
+	ip -4 route flush table "$LP_TABLE" 2>/dev/null
+	nft delete table inet l2tpipsec_dns 2>/dev/null
+	return 0
+}
+
+# 连接期间检查路由是否还在。网卡被系统重新配置时，内核会删掉经过它的路由。
+routing_check() {
+	local mode route dns
+	[ -f "$LP_DIR/routing-owned" ] || return 1
+	ip -4 rule show | awk '$1 == "10104:" {found=1} END {exit !found}' || return 1
+	read -r mode < "$LP_DIR/routing-mode"
+	if [ "$mode" = full ]; then
+		[ -n "$(ip -4 route show table "$LP_TABLE" default)" ] || return 1
+	else
+		while IFS= read -r route; do
+			[ -n "$route" ] || continue
+			[ -n "$(ip -4 route show table "$LP_TABLE" exact "$route")" ] || return 1
+		done < "$LP_DIR/routes"
+	fi
+	if [ -f "$LP_DIR/active-dns" ]; then
+		read -r dns < "$LP_DIR/active-dns"
+		[ -n "$(ip -4 route show table "$LP_TABLE" exact "$dns/32")" ] || return 1
+	fi
+	return 0
+}
+
 routing_up() {
 	local mode dns server_ip route device devices dns_pid
 	read -r mode < "$LP_DIR/routing-mode"
@@ -55,6 +88,8 @@ routing_up() {
 	# 没有域名规则时，网段分流无需 DNS 模块。
 	[ "$mode" = full ] || [ -s "$LP_DIR/domain-rules" ] || return 0
 	[ -n "$dns" ] || dns=${DNS1:-${DNS2:-}}
+	# 连接期间恢复路由时没有 pppd 传来的环境变量，用 ppp-hook 记下的地址
+	[ -n "$dns" ] || [ ! -f "$LP_DIR/peer-dns" ] || read -r dns < "$LP_DIR/peer-dns"
 	lp_ip4 "$dns" && [ "$dns" != "$server_ip" ] && [ "$dns" != 127.0.0.1 ] && [ "$dns" != 0.0.0.0 ] || {
 		printf '%s\n' '远端未下发可用 DNS，请填写 VPN DNS。' > "$LP_DIR/route.error"
 		return 1
@@ -117,5 +152,7 @@ EOF
 case "$1" in
 up) routing_up ;;
 down) routing_down ;;
+purge) routing_purge ;;
+check) routing_check ;;
 *) exit 1 ;;
 esac

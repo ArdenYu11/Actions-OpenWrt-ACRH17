@@ -20,7 +20,8 @@ running() {
 
 wait_stopped() {
 	local tries=0
-	while running && [ "$tries" -lt 50 ]; do
+	# procd 停止服务时最多等 15 秒才强制结束，这里多等一会儿
+	while running && [ "$tries" -lt 80 ]; do
 		sleep 0.2
 		tries=$((tries + 1))
 	done
@@ -91,6 +92,10 @@ IPsec 诊断：远端拒绝认证（AUTHENTICATION_FAILED）。"
 IPsec 诊断：双方加密算法不匹配（NO_PROPOSAL_CHOSEN）。"
 			grep -q 'giving up after' "$LP_DIR/charon.log" && log="$log
 IPsec 诊断：服务器未响应，请检查地址、防火墙和 UDP 500/4500。"
+		fi
+		if [ -s "$LP_DIR/l2tp.log" ]; then
+			log="$log
+$(tail -n 5 "$LP_DIR/l2tp.log" | sed 's/^/L2TP 诊断：/')"
 		fi
 		if [ -s "$LP_DIR/dns.log" ]; then
 			log="$log

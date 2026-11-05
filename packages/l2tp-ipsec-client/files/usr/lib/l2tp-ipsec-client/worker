@@ -6,9 +6,17 @@ mkdir -p "$LP_DIR"
 chmod 700 "$LP_DIR"
 mkdir "$LP_DIR/lock" 2>/dev/null || exit 1
 printf '%s\n' "$$" > "$LP_DIR/worker.pid"
+printf '%s\n' "$$" > "$LP_DIR/session"
 
 cleanup_attempt() {
 	lp_stop_pid "${command_pid:-}"
+	# 已被新连接接管时，只结束自己启动的进程，不碰新连接的路由和运行文件。
+	if ! lp_owns_session; then
+		lp_stop_pid "${l2tp_pid:-}"
+		lp_stop_pid "${charon_pid:-}"
+		l2tp_pid=""; charon_pid=""
+		return 0
+	fi
 	# 先结束 PPP 和 L2TP，再撤销 IPsec；阻断策略最后移除。
 	if [ -f "$LP_DIR/ppp.pid" ]; then
 		read -r ppp_pid < "$LP_DIR/ppp.pid"
@@ -29,31 +37,42 @@ cleanup_attempt() {
 		ip -4 route del "$server_ip/32" metric 41717 2>/dev/null
 	fi
 	rm -f "$LP_DIR/ppp.pid" "$LP_DIR/ppp.up" "$LP_DIR/l2tp-control" "$LP_DIR/xl2tpd.pid" "$LP_DIR/charon.vici"
-	rm -f "$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options"
+	rm -f "$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options" "$LP_DIR/charon.pid" "$LP_DIR/peer-dns"
 	l2tp_pid=""; charon_pid=""; block_added=0; host_added=0
 }
 
 finish() {
 	trap '' TERM INT
 	cleanup_attempt
-	lp_state disconnected '连接已断开。'
-	rm -f "$LP_DIR/worker.pid"
-	rmdir "$LP_DIR/lock" 2>/dev/null
+	if lp_owns_session; then
+		lp_state disconnected '连接已断开。'
+		rm -f "$LP_DIR/worker.pid" "$LP_DIR/session"
+		rmdir "$LP_DIR/lock" 2>/dev/null
+	fi
 	exit 0
 }
 trap finish TERM INT
-trap 'rm -f "$LP_DIR/worker.pid"; rmdir "$LP_DIR/lock" 2>/dev/null' EXIT
+trap 'if lp_owns_session; then rm -f "$LP_DIR/worker.pid" "$LP_DIR/session"; rmdir "$LP_DIR/lock" 2>/dev/null; fi' EXIT
+
+# 路由被系统清掉（例如网卡被重新配置）时原地补回，不断开 VPN，也不需要重新在手机上确认。
+repair_routing() {
+	"$LP_LIB/routing" down
+	rm -f "$LP_DIR/route.error"
+	"$LP_LIB/routing" up
+}
 
 attempt() {
 	lp_state resolving '正在解析服务器地址。'
 	server_ip=$(resolveip -4 -t 5 "$server" 2>/dev/null | head -n 1)
 	lp_ip4 "$server_ip" || { lp_state error '服务器地址解析失败，请检查域名和 WAN DNS。'; return 1; }
-	# 单独管理 charon，检测其他实例后给出提示，避免争用 IKE 端口。
-	if pidof charon charon-systemd starter xl2tpd >/dev/null 2>&1; then
-		lp_state conflict '检测到其他 IPsec 或 L2TP 进程，请先停用其连接后重试。'
+	# 单独管理 charon，检测其他实例后给出提示，避免争用 IKE 和 L2TP 端口。
+	local conflicts
+	conflicts=$(lp_conflicts)
+	if [ -n "$conflicts" ]; then
+		lp_state conflict "检测到其他 IPsec/L2TP 进程：${conflicts}。请先停用对应服务（xl2tpd 用 /etc/init.d/xl2tpd stop，charon/starter 用 /etc/init.d/swanctl stop 或 /etc/init.d/ipsec stop），再重新连接。"
 		return 2
 	fi
-	local route_line gateway wan_dev
+	local route_line gateway wan_dev deadline seen_ppp=0 repairs=0
 	route_line=$(ip -4 route get "$server_ip" 2>/dev/null | head -n 1)
 	wan_dev=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}')
 	gateway=$(printf '%s\n' "$route_line" | awk '{for(i=1;i<=NF;i++) if($i=="via") print $(i+1)}')
@@ -70,7 +89,8 @@ attempt() {
 		host_added=1
 	fi
 	# 无 CHILD_SA 时阻止 UDP/1701 裸发；IPsec 建立后的精确策略优先。
-	ip xfrm policy add dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 action block priority 424242 || {
+	# 用 update 而不是 add，上次异常退出留下同样的策略也能直接覆盖。
+	ip xfrm policy update dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 action block priority 424242 || {
 		lp_state error '无法安装 L2TP 保护策略，请检查内核 IPsec 模块。'; return 1;
 	}
 	block_added=1
@@ -78,6 +98,7 @@ attempt() {
 	: > "$LP_DIR/charon.log"
 	STRONGSWAN_CONF="$LP_DIR/strongswan.conf" /usr/lib/ipsec/charon >/dev/null 2>&1 &
 	charon_pid=$!
+	printf '%s\n' "$charon_pid" > "$LP_DIR/charon.pid"
 	local count=0
 	while [ ! -S "$LP_DIR/charon.vici" ] && [ "$count" -lt 10 ]; do
 		lp_alive "$charon_pid" || break
@@ -90,8 +111,12 @@ attempt() {
 	lp_state ipsec '正在建立 IPsec 加密连接。'
 	lp_wait_command swanctl --initiate --child "$LP_CONN" --timeout 25 --uri "$LP_URI" >/dev/null 2>&1
 	lp_has_ipsec || { lp_state error 'IPsec 协商失败，请检查 PSK、身份标识和加密算法。'; return 1; }
-	lp_state ppp 'IPsec 已建立，正在验证账号并连接 PPP。'
-	xl2tpd -D -c "$LP_DIR/xl2tpd.conf" -C "$LP_DIR/l2tp-control" -p "$LP_DIR/xl2tpd.pid" >/dev/null 2>&1 &
+	lp_state ppp "IPsec 已建立，正在验证账号并连接 PPP；如需在手机上确认登录，请在 ${LP_PPP_TIMEOUT} 秒内完成。"
+	# xl2tpd-control 的结果管道路径写死在这个目录，目录不在就会直接拨号失败
+	mkdir -p "$LP_XL2TPD_RUN" && chmod 700 "$LP_XL2TPD_RUN"
+	: > "$LP_DIR/l2tp.log"
+	# -l 让前台运行的 xl2tpd 也写系统日志（logread -e xl2tpd）
+	xl2tpd -D -l -c "$LP_DIR/xl2tpd.conf" -C "$LP_DIR/l2tp-control" -p "$LP_DIR/xl2tpd.pid" >> "$LP_DIR/l2tp.log" 2>&1 &
 	l2tp_pid=$!
 	count=0
 	while [ ! -p "$LP_DIR/l2tp-control" ] && [ "$count" -lt 5 ]; do
@@ -99,15 +124,22 @@ attempt() {
 	done
 	[ -p "$LP_DIR/l2tp-control" ] || { lp_state error 'L2TP 进程启动失败。'; return 1; }
 	# FIFO 使用非阻塞打开，防止子进程退出后工作进程卡住。
-	lp_wait_command xl2tpd-control -c "$LP_DIR/l2tp-control" connect-lac "$LP_CONN" >/dev/null 2>&1 || {
-		lp_state error 'L2TP 拨号失败。'; return 1;
-	}
-	count=0
-	while [ ! -f "$LP_DIR/ppp.up" ] && [ "$count" -lt 30 ]; do
+	if ! lp_wait_command xl2tpd-control -c "$LP_DIR/l2tp-control" connect-lac "$LP_CONN" >> "$LP_DIR/l2tp.log" 2>&1; then
+		lp_log "xl2tpd-control：$(tail -n 1 "$LP_DIR/l2tp.log")"
+		lp_state error 'L2TP 拨号失败，详见连接日志。'
+		return 1
+	fi
+	deadline=$(($(date +%s) + LP_PPP_TIMEOUT))
+	while [ ! -f "$LP_DIR/ppp.up" ] && [ "$(date +%s)" -lt "$deadline" ]; do
 		lp_alive "$l2tp_pid" && lp_has_ipsec || break
-		lp_sleep 1; count=$((count + 1))
+		# pppd 起来过又退出，说明认证已经失败，不必等到超时
+		if lp_pppd_running; then seen_ppp=1; elif [ "$seen_ppp" = 1 ]; then break; fi
+		lp_sleep 1
 	done
-	[ -f "$LP_DIR/ppp.up" ] || { lp_state error 'PPP 连接失败，请检查账号密码、PAP 设置和 UDP 1701 连通性。'; return 1; }
+	[ -f "$LP_DIR/ppp.up" ] || {
+		lp_state error "PPP 连接失败，请检查账号密码、是否已在手机上确认登录（限 ${LP_PPP_TIMEOUT} 秒），以及 UDP 1701 连通性。"
+		return 1
+	}
 	if [ -f "$LP_DIR/route.error" ]; then
 		read -r route_error < "$LP_DIR/route.error"
 		lp_state error "$route_error"
@@ -121,6 +153,19 @@ attempt() {
 			read -r dns_pid < "$LP_DIR/dns.pid"
 			lp_alive "$dns_pid" || { lp_state error 'DNS 分流进程退出，正在停止连接。'; return 1; }
 		fi
+		# 网卡被系统重新配置时，地址和路由会被清空，状态却还停在「已连接」
+		if ! ip -4 address show dev "$LP_IFACE" 2>/dev/null | grep -q 'inet '; then
+			lp_state error 'VPN 网卡的地址被系统清除（通常是网络服务重启引起），连接已失效，请重新连接。'
+			return 1
+		fi
+		if ! "$LP_LIB/routing" check; then
+			repairs=$((repairs + 1))
+			if [ "$repairs" -gt 3 ] || ! repair_routing; then
+				lp_state error 'VPN 路由被系统清除且无法恢复，请重新连接。'
+				return 1
+			fi
+			lp_log 'VPN 路由被系统清除，已自动恢复。访问内网域名不通时，请在电脑上清一下 DNS 缓存。'
+		fi
 		lp_sleep 5
 	done
 	lp_state error '连接中断。'
@@ -132,13 +177,22 @@ if ! lp_validate; then
 	lp_state error "$LP_ERROR"
 	exit 1
 fi
+lp_cleanup_leftovers
+# 每次连接前补齐防火墙配置，恢复旧备份后也能自动补回
+if [ -x "$LP_LIB/ensure-config" ] && ! "$LP_LIB/ensure-config" >/dev/null 2>&1; then
+	lp_log '防火墙配置检查失败，局域网设备可能无法经 VPN 访问。'
+fi
 lp_retry_reset
 while :; do
 	attempt
 	result=$?
 	cleanup_attempt
+	lp_owns_session || exit 0
 	[ "$result" = 2 ] && exit 1
-	[ "$reconnect" = 1 ] || exit 1
+	if [ "$reconnect" != 1 ]; then
+		lp_log '自动重连已关闭，连接已停止。需要时请手动重新连接。'
+		exit 1
+	fi
 	if ! lp_retry_plan; then
 		lp_state error "已达到最大重连次数（${retry_max_attempts} 次），连接已停止。"
 		exit 1

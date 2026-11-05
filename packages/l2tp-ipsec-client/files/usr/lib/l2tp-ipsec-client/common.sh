@@ -7,6 +7,10 @@ LP_REQID=41717
 LP_CONN=l2tpipsec
 LP_IFACE=l2tp-vpn
 LP_URI="unix://$LP_DIR/charon.vici"
+# xl2tpd-control 的结果管道固定建在这个目录，系统 xl2tpd 服务停用后没人创建它
+LP_XL2TPD_RUN=${LP_XL2TPD_RUN:-/var/run/xl2tpd}
+# PPP 认证阶段可能要在手机上确认登录，等待时间要留足
+LP_PPP_TIMEOUT=90
 
 lp_load() {
 	. /lib/functions.sh
@@ -208,6 +212,7 @@ refuse-chap
 refuse-mschap
 refuse-mschap-v2
 noccp
+pap-max-authreq $((LP_PPP_TIMEOUT / 3))
 noipdefault
 nodefaultroute
 usepeerdns
@@ -246,10 +251,83 @@ EOF
 }
 
 lp_has_ipsec() {
-	local sas
-	sas=$(lp_swan --list-sas 2>/dev/null) || return 1
-	printf '%s\n' "$sas" | grep -q "${LP_CONN}: #.*ESTABLISHED" &&
-	printf '%s\n' "$sas" | grep -q "${LP_CONN}: #.*INSTALLED"
+	local output="$LP_DIR/sas.$$" result=1
+	if lp_capture 5 "$output" lp_swan --list-sas; then
+		grep -q "${LP_CONN}: #.*ESTABLISHED" "$output" &&
+		grep -q "${LP_CONN}: #.*INSTALLED" "$output" && result=0
+	fi
+	rm -f "$output"
+	return "$result"
+}
+
+# 带超时运行命令，输出写入文件。超时后不再等待：卡在内核不可中断状态的进程连 kill -9 都要等，
+# 不能让工作进程跟着卡住。
+lp_capture() {
+	local limit="$1" output="$2" pid ticks=0
+	shift 2
+	"$@" > "$output" 2>/dev/null &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		if [ "$ticks" -ge $((limit * 10)) ]; then
+			kill -9 "$pid" 2>/dev/null
+			return 124
+		fi
+		sleep 0.1
+		ticks=$((ticks + 1))
+	done
+	wait "$pid"
+}
+
+# 列出会和本插件抢端口的其他 IPsec/L2TP 进程，格式如「xl2tpd（PID 123）」。
+lp_conflicts() {
+	local name pid list=""
+	for name in charon charon-systemd starter xl2tpd; do
+		for pid in $(pidof "$name" 2>/dev/null); do
+			list="${list:+${list}、}${name}（PID ${pid}）"
+		done
+	done
+	printf '%s' "$list"
+}
+
+# 本连接的 pppd 是否还在。WAN 用 PPPoE 时也有 pppd，所以按命令行里的选项文件区分。
+lp_pppd_running() {
+	local pid
+	for pid in $(pidof pppd 2>/dev/null); do
+		tr '\000' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qF "$LP_DIR/ppp.options" && return 0
+	done
+	return 1
+}
+
+# 只有当前连接的工作进程才能清理共享的运行目录和路由，避免残留的旧进程拆掉新连接。
+lp_owns_session() {
+	[ "$(cat "$LP_DIR/session" 2>/dev/null)" = "$$" ]
+}
+
+# 清理上次异常退出留下的东西：本插件的进程、路由规则、DNS 表、阻断策略和状态文件。
+# 进程只按本插件的 pid 文件结束，并核对进程名，不会误杀其他服务。
+lp_cleanup_leftovers() {
+	local entry file comm pid old_ip
+	for entry in ppp:pppd xl2tpd:xl2tpd charon:charon dns:domain-dns; do
+		file="$LP_DIR/${entry%%:*}.pid"
+		comm=${entry#*:}
+		[ -f "$file" ] || continue
+		read -r pid < "$file"
+		case "$pid" in ''|*[!0-9]*) ;; *)
+			[ "$(cat "/proc/$pid/comm" 2>/dev/null)" = "$comm" ] && lp_stop_pid "$pid"
+		;; esac
+		rm -f "$file"
+	done
+	"$LP_LIB/routing" purge >/dev/null 2>&1
+	if [ -f "$LP_DIR/server-ip" ]; then
+		read -r old_ip < "$LP_DIR/server-ip"
+		if lp_ip4 "$old_ip"; then
+			ip xfrm policy delete dir out src 0.0.0.0/0 dst "$old_ip/32" proto udp sport 1701 dport 1701 2>/dev/null
+			ip -4 route del "$old_ip/32" metric 41717 2>/dev/null
+		fi
+	fi
+	rm -f "$LP_DIR/ppp.up" "$LP_DIR/route.error" "$LP_DIR/l2tp-control" "$LP_DIR/charon.vici" \
+		"$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options" "$LP_DIR/peer-dns" "$LP_DIR"/sas.*
+	return 0
 }
 
 lp_alive() {
