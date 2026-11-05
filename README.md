@@ -4,11 +4,9 @@
 
 ## 编译
 
-Actions → **Build RT-ACRH17 (lede)** → Run workflow。首次编译约 2–3 小时。
+Actions → **Build RT-ACRH17 (lede)** → Run workflow。选择分支，并设置「编译成功后发布 Release」（默认关闭）。首次编译约 2–3 小时。
 
-编译成功后固件在两处：
-- Releases：每次编译成功都会自动发布一个
-- 这次运行页面底部的 Artifacts
+编译成功后，固件始终上传到这次运行页面底部的 Artifacts；只有开启发布选项，才会同时创建 Release。验证构建保持发布选项关闭，下载附件验收后再决定发布。
 
 ## 文件说明
 
