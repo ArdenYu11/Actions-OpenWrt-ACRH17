@@ -1,0 +1,50 @@
+name: Check L2TP-IPsec plugin
+
+on:
+  push:
+    paths:
+      - 'packages/**'
+      - 'preview/**'
+      - 'tests/**'
+      - 'diy-part2.sh'
+      - '.github/workflows/check-vpn-plugin.yml'
+  pull_request:
+    paths:
+      - 'packages/**'
+      - 'preview/**'
+      - 'tests/**'
+      - 'diy-part2.sh'
+      - '.github/workflows/check-vpn-plugin.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check generated configuration and worker lifecycle
+        run: |
+          python3 tests/test_backend.py
+          python3 tests/test_linux_integration.py
+      - name: Check JavaScript and shell syntax
+        run: |
+          node --check packages/luci-app-l2tp-ipsec-client/htdocs/luci-static/resources/view/l2tp-ipsec-client.js
+          node --check preview/preview.js
+          # UCI 动态赋值和运行时导入由集成测试验证。
+          find packages -type f -exec sh -c '
+            for file do
+              if head -n 1 "$file" | grep -q "^#!/bin/sh"; then
+                shellcheck -s dash -S warning -e SC1091,SC2034,SC2154,SC2016 "$file"
+              fi
+            done
+          ' sh {} +
+          bash -n diy-part2.sh
+      - name: Generate preview
+        run: python3 preview/build.py preview/standalone.html
+      - name: Upload preview
+        uses: actions/upload-artifact@v7
+        with:
+          name: L2TP-IPsec-settings-preview
+          path: preview/standalone.html
