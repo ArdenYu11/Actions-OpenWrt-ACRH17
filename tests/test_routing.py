@@ -27,7 +27,9 @@ class RoutingTests(unittest.TestCase):
         mocks = {
             'ip': '''printf 'ip %s\\n' "$*" >> "$TRACE"
 case "$*" in
+*"route show table 41717 exact"*|*"route show table 41717 default"*) [ "${MISSING:-0}" = 1 ] || echo 'x dev l2tp-vpn' ;;
 *"route show table 41717"*) [ "${CONFLICT:-0}" = 1 ] && echo 'default dev other' ;;
+*"rule show"*) [ "${RULES:-0}" = 1 ] && printf '10104:\\tfrom all lookup 41717\\n' ;;
 *"rule del"*) exit 1 ;;
 *"route show table main"*) echo '192.168.1.0/24 dev br-lan proto kernel scope link' ;;
 esac
@@ -91,6 +93,35 @@ exit 0'''
         self.assertIn('--vpn-dns 10.30.0.53', trace)
         self.assertIn('suppress_prefixlength 0', trace)
         self.assertIn('chain ipv6_forward', (self.dir / 'dns.nft').read_text())
+
+    def test_peer_dns_file_used_when_repairing(self):
+        (self.dir / 'domain-rules').write_text('prefix api.\n')
+        (self.dir / 'peer-dns').write_text('10.20.0.53\n')
+        result = self.run_script('up')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('--vpn-dns 10.20.0.53', self.trace.read_text())
+
+    def test_purge_removes_plugin_state_without_owner_marks(self):
+        result = self.run_script('purge')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        trace = self.trace.read_text()
+        for priority in (10100, 10101, 10102, 10103, 10104):
+            self.assertIn(f'rule del priority {priority}', trace)
+        self.assertIn('route flush table 41717', trace)
+        self.assertIn('nft delete table inet l2tpipsec_dns', trace)
+
+    def test_check_detects_missing_routes(self):
+        self.assertNotEqual(self.run_script('check', RULES='1').returncode, 0)
+        (self.dir / 'routing-owned').write_text('')
+        self.assertEqual(self.run_script('check', RULES='1').returncode, 0)
+        self.assertNotEqual(self.run_script('check', RULES='0').returncode, 0)
+        self.assertNotEqual(self.run_script('check', RULES='1', MISSING='1').returncode, 0)
+        (self.dir / 'routing-mode').write_text('full\n')
+        self.assertEqual(self.run_script('check', RULES='1').returncode, 0)
+        self.assertIn('route show table 41717 default', self.trace.read_text())
+        (self.dir / 'active-dns').write_text('10.20.0.53\n')
+        self.assertEqual(self.run_script('check', RULES='1').returncode, 0)
+        self.assertIn('route show table 41717 exact 10.20.0.53/32', self.trace.read_text())
 
     def test_missing_dns_and_conflict_cleanup(self):
         (self.dir / 'domain-rules').write_text('exact api.example.com\n')

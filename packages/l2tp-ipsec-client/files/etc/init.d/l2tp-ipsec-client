@@ -5,6 +5,8 @@ STOP=10
 USE_PROCD=1
 
 boot() {
+	# 开机时补齐防火墙配置，此时还没有 VPN 连接
+	/usr/lib/l2tp-ipsec-client/ensure-config
 	. /lib/functions.sh
 	config_load l2tpipsec
 	config_get_bool enabled main enabled 0

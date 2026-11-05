@@ -264,7 +264,7 @@ return view.extend({
     return E('button', { 'class': 'cbi-button ' + style, 'click': ui.createHandlerFn(self, run) }, label);
    };
    self.connectButton = action('保存并连接', 'cbi-button-positive', function() { return self.saveAndRun(startRPC); });
-   self.stopButton = action('断开连接', 'cbi-button-negative', function() { return self.runAction(stopRPC); });
+   self.stopButton = action('断开连接', 'cbi-button-negative', function() { return self.runAction(stopRPC, '断开连接'); });
    self.saveButton = action('保存设置', 'cbi-button-apply', function() { return self.saveAndRun(null); });
    var node = E('div', { 'class': 'lp-page' }, [
     E('style', {}, `.lp-page select,.lp-rule-modal select{appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 14 14'%3E%3Cpath d='M3 5l4 4 4-4' fill='none' stroke='%2353667c' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 14px center;padding-right:42px!important}.lp-page .cbi-dropdown>span.open{padding-right:14px;margin-right:4px}.lp-rule-list{border:1px solid #dbe2ea;border-radius:7px;overflow:hidden}.lp-rules-empty{padding:20px;color:#788799;background:#f8fafc;line-height:1.7}.lp-rule-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:13px 15px;border-bottom:1px solid #e8edf3}.lp-rule-row:last-child{border-bottom:0}.lp-rule-content{display:flex;align-items:center;gap:12px;min-width:0;flex-wrap:wrap}.lp-rule-type{font-size:12px;color:#506784;background:#edf3fb;padding:3px 8px;border-radius:4px;white-space:nowrap}.lp-rule-value{overflow-wrap:anywhere}.lp-rule-actions{display:flex;gap:8px;flex-shrink:0}.lp-rule-actions button{font-size:12px;padding:5px 9px}.lp-rule-delete{color:#ae4343}.lp-add-rule{margin-top:12px}.lp-rule-modal [hidden]{display:none!important}.lp-modal-field{display:flex;flex-direction:column;gap:7px;margin:15px 0}.lp-modal-field label{font-weight:500}.lp-modal-field input,.lp-modal-field select{box-sizing:border-box;width:100%;max-width:none;font:inherit;min-height:40px;padding:9px 12px;border:1px solid #cfd8e5;border-radius:5px;background-color:#fff;color:#263548}.lp-modal-help{color:#788799;font-size:13px;line-height:1.7}.lp-modal-error{color:#b91c1c;font-size:13px;min-height:20px}.lp-modal-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}@media(max-width:600px){.lp-rule-row{align-items:flex-start;gap:10px}.lp-rule-content{gap:7px;flex-direction:column;align-items:flex-start}}.lp-status{padding:18px 20px;border:1px solid #dbe2ea;border-radius:8px;background:#f8fafc;margin:0 0 22px;color:#263548}.lp-status-heading{display:flex;align-items:center;gap:10px;margin-bottom:8px}.lp-badge{font-weight:600;padding:3px 10px;border-radius:20px;background:#e5eaf0;color:#536273}.lp-badge[data-phase="connected"]{background:#dcfce7;color:#166534}.lp-badge[data-phase="error"],.lp-badge[data-phase="conflict"]{background:#fee2e2;color:#991b1b}.lp-steps{display:flex;gap:28px;margin-top:16px;flex-wrap:wrap}.lp-step{font-size:13px;color:#59687b}.lp-step[data-ok="true"]{color:#15803d}.lp-actions{display:flex;gap:10px;flex-wrap:wrap;margin:24px 0}.lp-log{white-space:pre-wrap;overflow-wrap:anywhere;background:#152132;color:#d7e3f0;padding:18px;border-radius:8px;min-height:100px;max-height:300px;overflow:auto;font-size:12px;line-height:1.7}.lp-details{color:#69798b;font-size:12px;margin-top:12px}.lp-note{font-size:13px;color:#66778a;margin-top:16px}.lp-page details>summary{cursor:pointer;margin:18px 0 10px;font-weight:600}`),
@@ -308,22 +308,33 @@ return view.extend({
   return Promise.all([statusRPC(), logsRPC()]).then(function(data) { self.paint(data[0], data[1]); });
  },
 
- runAction: function(fn) {
+ // LuCI 的按钮包装不会显示 Promise 里的错误，每一步都自己提示，避免点了没反应。
+ notifyError: function(step, err) {
+  var detail = err && err.message ? err.message : (typeof err === 'number' ? '错误码 ' + err : String(err));
+  ui.addNotification(null, E('p', {}, step + '失败：' + detail), 'error');
+ },
+
+ runAction: function(fn, step) {
   var self = this;
   return fn().then(function(reply) {
    ui.addNotification(null, E('p', {}, reply.message), reply.ok ? 'info' : 'error');
-   return self.refresh();
-  });
+   return self.refresh().catch(function() {});
+  }).catch(function(err) { self.notifyError(step, err); });
  },
 
  saveAndRun: function(fn) {
-  var self = this;
-  return this.map.save().then(function() { return uci.apply(); })
-   .then(function() { return validateRPC(); })
+  var self = this, step = '保存设置';
+  return this.map.save()
+   .then(function() { step = '应用设置'; return uci.apply(); })
+   .then(function() { step = '检查配置'; return validateRPC(); })
    .then(function(reply) {
     if (!reply.ok) throw new Error(reply.message);
-    if (fn) return self.runAction(fn);
+    if (fn) return self.runAction(fn, '启动连接');
     ui.addNotification(null, E('p', {}, '设置已保存。连接参数会在下次连接时生效。'), 'info');
+   })
+   .catch(function(err) {
+    // 表单保存失败时 LuCI 自己会弹窗说明，不重复提示
+    if (step !== '保存设置') self.notifyError(step, err);
    });
  },
 

@@ -39,11 +39,13 @@ lp_swan() { return 0; }
             '. /usr/lib/l2tp-ipsec-client/common.sh', f'. {common}')
         worker = worker.replace('/usr/lib/ipsec/charon', str(self.bin / 'charon'))
         (self.lib / 'worker').write_text(worker)
+        self.xl2tpd_run = self.directory / 'xl2tpd-run'
         self.env = {**os.environ, 'LP_DIR': str(self.runtime), 'LP_LIB': str(self.lib),
+                    'LP_XL2TPD_RUN': str(self.xl2tpd_run),
                     'TEST_TRACE': str(self.trace), 'PATH': str(self.bin) + ':' + os.environ['PATH']}
         mocks = {
             'resolveip': '[ "${TEST_RESOLVE_FAIL:-0}" = 0 ] && echo 192.0.2.20',
-            'pidof': '[ "${TEST_CONFLICT:-0}" = 1 ]',
+            'pidof': '[ "${TEST_CONFLICT:-0}" = 1 ] && [ "$1" = xl2tpd ] && echo 4242',
             'ip': '''case "$*" in
 *"route get"*) echo "192.0.2.20 via 172.17.0.1 dev eth0 src 172.17.0.2" ;;
 *"route show"*) : ;;
@@ -65,13 +67,20 @@ sleep 120 &
 child=$!
 trap 'kill "$child" 2>/dev/null; exit 0' TERM INT
 wait "$child"''',
-            'xl2tpd-control': 'exit 0',
+            # 真实的 xl2tpd-control 把结果管道写死在 /var/run/xl2tpd，目录不在就直接失败
+            'xl2tpd-control': '''if [ "${TEST_L2TP_FAIL:-0}" = 1 ] || [ ! -d "$LP_XL2TPD_RUN" ]; then
+ echo "error: unable to open $LP_XL2TPD_RUN/xl2tpd-control-$$.out for reading." >&2
+ exit 254
+fi
+printf 'xl2tpd-control-ok\\n' >> "$TEST_TRACE"''',
         }
         for name, source in mocks.items():
             path = self.bin / name
             path.write_text('#!/bin/sh\n' + source + '\n')
             path.chmod(0o755)
         (self.lib / 'ppp-hook').write_text('#!/bin/sh\nexit 0\n')
+        for name in ('routing', 'ensure-config'):
+            (self.lib / name).write_text(f'#!/bin/sh\nprintf "{name} %s\\n" "$*" >> "$TEST_TRACE"\nexit 0\n')
         self.process = None
 
     def tearDown(self):
@@ -97,12 +106,18 @@ wait "$child"''',
         out, err = self.process.communicate(timeout=2) if self.process.poll() is not None else ('', '')
         self.fail(f'没有到达状态 {value}: {out} {err} {self.trace.read_text() if self.trace.exists() else ""}')
 
+    def events(self):
+        path = self.runtime / 'events.log'
+        return path.read_text() if path.exists() else ''
+
     def test_existing_service_conflict_does_not_change_routes(self):
         self.start(TEST_CONFLICT='1')
         self.process.wait(timeout=5)
         trace = self.trace.read_text()
         self.assertIn('conflict|', trace)
-        self.assertNotIn('ip xfrm policy add', trace)
+        self.assertIn('xl2tpd（PID 4242）', trace)
+        self.assertIn('/etc/init.d/xl2tpd stop', trace)
+        self.assertNotIn('ip xfrm policy update', trace)
         self.assertFalse((self.runtime / 'lock').exists())
 
     def test_failure_cleans_owned_routes_and_credentials(self):
@@ -110,11 +125,68 @@ wait "$child"''',
         self.process.wait(timeout=8)
         trace = self.trace.read_text()
         self.assertIn('error|IPsec 协商失败', trace)
-        self.assertIn('ip xfrm policy add', trace)
+        self.assertIn('ip xfrm policy update', trace)
         self.assertIn('ip xfrm policy delete', trace)
         self.assertIn('ip -4 route del 192.0.2.20/32 metric 41717', trace)
         self.assertFalse((self.runtime / 'swanctl.conf').exists())
         self.assertFalse((self.runtime / 'ppp.options').exists())
+        self.assertIn('自动重连已关闭', self.events())
+
+    def test_config_check_and_leftover_cleanup_run_before_connect(self):
+        self.runtime.mkdir()
+        (self.runtime / 'ppp.up').write_text('')
+        (self.runtime / 'server-ip').write_text('198.51.100.7\n')
+        self.start(TEST_PHASE='ipsec')
+        self.wait_for('ipsec-wait')
+        trace = self.trace.read_text()
+        self.assertIn('routing purge', trace)
+        self.assertIn('ensure-config', trace)
+        self.assertIn('ip xfrm policy delete dir out src 0.0.0.0/0 dst 198.51.100.7/32', trace)
+        self.assertIn('ip -4 route del 198.51.100.7/32 metric 41717', trace)
+        self.assertLess(trace.index('routing purge'), trace.index('resolving|'))
+        self.assertFalse((self.runtime / 'ppp.up').exists())
+
+    @unittest.skipUnless(os.path.exists('/proc/self/comm'), '需要 Linux /proc 核对进程名')
+    def test_orphaned_process_from_crashed_session_is_stopped(self):
+        self.runtime.mkdir()
+        orphan = subprocess.Popen([str(self.bin / 'charon')], env={**self.env})
+        try:
+            deadline = time.monotonic() + 3
+            while not (self.runtime / 'charon.vici').exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            (self.runtime / 'charon.pid').write_text(f'{orphan.pid}\n')
+            self.start(TEST_PHASE='ipsec')
+            self.wait_for('ipsec-wait')
+            orphan.wait(timeout=5)
+        finally:
+            if orphan.poll() is None:
+                orphan.kill()
+                orphan.wait()
+
+    def test_l2tp_dial_creates_result_pipe_directory(self):
+        self.start(TEST_PHASE='ppp')
+        self.wait_for('xl2tpd-control-ok')
+        self.assertTrue(self.xl2tpd_run.is_dir())
+        self.assertIn('ppp|', self.trace.read_text())
+        self.assertIn('手机上确认登录', self.trace.read_text())
+
+    def test_l2tp_dial_failure_is_logged(self):
+        self.start(TEST_PHASE='ppp', TEST_L2TP_FAIL='1')
+        self.process.wait(timeout=8)
+        self.assertIn('error|L2TP 拨号失败', self.trace.read_text())
+        events = self.events()
+        self.assertIn('unable to open', events)
+        self.assertIn('自动重连已关闭', events)
+
+    def test_superseded_worker_leaves_new_session_alone(self):
+        self.start(TEST_PHASE='ipsec')
+        self.wait_for('ipsec-wait')
+        (self.runtime / 'session').write_text('999999\n')
+        self.process.terminate()
+        self.process.wait(timeout=7)
+        self.assertNotIn('disconnected|', self.trace.read_text())
+        self.assertTrue((self.runtime / 'lock').exists())
+        self.assertNotIn('ip xfrm policy delete dir out src 0.0.0.0/0 dst 192.0.2.20/32', self.trace.read_text())
 
     def test_stop_interrupts_ipsec_wait(self):
         self.start(TEST_PHASE='ipsec')

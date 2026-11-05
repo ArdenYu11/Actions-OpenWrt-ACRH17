@@ -16,59 +16,11 @@ if ! grep -Eq '^[[:space:]]*\[(lac|lns)[[:space:]]' /etc/xl2tpd/xl2tpd.conf; the
 	[ -n "$IPKG_INSTROOT" ] || /etc/init.d/xl2tpd stop
 fi
 
-# 固定接口名供 PPP、netifd 与防火墙共同使用。
-if ! uci -q get network.l2tpipsec >/dev/null; then
-	uci set network.l2tpipsec=interface
-	uci set network.l2tpipsec.proto=none
-	uci set network.l2tpipsec.device=l2tp-vpn
-	uci set network.l2tpipsec.ifname=l2tp-vpn
-	uci set network.l2tpipsec.auto=1
-	uci commit network
-fi
-
-if ! uci -q get firewall.l2tpipsec >/dev/null; then
-	uci set firewall.l2tpipsec=zone
-	uci set firewall.l2tpipsec.name=l2tpipsec
-	uci add_list firewall.l2tpipsec.network=l2tpipsec
-	uci set firewall.l2tpipsec.input=REJECT
-	uci set firewall.l2tpipsec.output=ACCEPT
-	uci set firewall.l2tpipsec.forward=REJECT
-	uci set firewall.l2tpipsec.masq=1
-	uci set firewall.l2tpipsec.mtu_fix=1
-	uci set firewall.l2tpipsec_lan=forwarding
-	uci set firewall.l2tpipsec_lan.src=lan
-	uci set firewall.l2tpipsec_lan.dest=l2tpipsec
-	uci commit firewall
-fi
-
-# 仅接受此实例已解密的 L2TP，保护外层 IPsec 不被 WAN NAT 改写。
-uci set firewall.l2tpipsec_input=include
-uci set firewall.l2tpipsec_input.type=nftables
-uci set firewall.l2tpipsec_input.path=/usr/share/l2tp-ipsec-client/input.nft
-uci set firewall.l2tpipsec_input.position=chain-prepend
-uci set firewall.l2tpipsec_input.chain=input
-uci set firewall.l2tpipsec_snat=include
-uci set firewall.l2tpipsec_snat.type=nftables
-uci set firewall.l2tpipsec_snat.path=/usr/share/l2tp-ipsec-client/snat.nft
-uci set firewall.l2tpipsec_snat.position=chain-prepend
-uci set firewall.l2tpipsec_snat.chain=srcnat
-uci commit firewall
-
-# DNS 模块只向 LAN 和路由器本机提供服务。
-uci set firewall.l2tpipsec_dns=rule
-uci set firewall.l2tpipsec_dns.name='Allow-L2TP-IPsec-DNS'
-uci set firewall.l2tpipsec_dns.src=lan
-uci set firewall.l2tpipsec_dns.proto='tcp udp'
-uci set firewall.l2tpipsec_dns.dest_port=1053
-uci set firewall.l2tpipsec_dns.family=any
-uci set firewall.l2tpipsec_dns.target=ACCEPT
-uci commit firewall
-
 # 由 UCI 开关决定是否在开机时连接，初始配置默认关闭。
 /etc/init.d/l2tp-ipsec-client enable
-[ -n "$IPKG_INSTROOT" ] || {
-	/etc/init.d/network reload
-	/etc/init.d/firewall reload
-	/etc/init.d/rpcd restart
-}
+
+# 防火墙配置交给可重复执行的检查脚本；开机和每次连接前还会再检查，
+# 用旧备份恢复配置后也能自动补回。
+/usr/lib/l2tp-ipsec-client/ensure-config
+[ -n "$IPKG_INSTROOT" ] || /etc/init.d/rpcd restart
 exit 0

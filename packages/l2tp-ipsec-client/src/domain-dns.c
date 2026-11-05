@@ -23,7 +23,7 @@ struct rule { char kind[8], value[254]; };
 struct route { char ip[INET_ADDRSTRLEN]; time_t expires; };
 static struct rule rules[MAX_RULES];
 static struct route routes[MAX_ROUTES];
-static size_t rule_count, route_count;
+static size_t rule_count, route_count, route_limit = MAX_ROUTES;
 static const char *ip_tool = "/sbin/ip";
 static volatile sig_atomic_t stopping;
 static unsigned int socket_mark;
@@ -74,6 +74,19 @@ static int route_command(const char *action, const char *ip) {
  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
+/* 表满时腾出一个 DNS 有效期已过的位置，选过期最早的。有效期内的地址不动。 */
+static int evict_expired(void) {
+ time_t t = now();
+ size_t oldest = route_count;
+ for (size_t i=0; i<route_count; i++)
+  if (routes[i].expires <= t && (oldest == route_count || routes[i].expires < routes[oldest].expires)) oldest = i;
+ if (oldest == route_count || route_command("del", routes[oldest].ip)) return -1;
+ routes[oldest] = routes[--route_count];
+ return 0;
+}
+
+/* 学到的地址在整个连接期间保留，退出时统一删除。按 DNS TTL 删除会让 SSH 这类长连接
+ * 在 TTL 到期后中断；只有表满时才回收已过期的地址。 */
 static int add_route(const unsigned char *address, uint32_t ttl) {
  if (address[0] == 0 || address[0] == 127 || address[0] >= 224 || (address[0] == 169 && address[1] == 254)) return 0;
  char ip[INET_ADDRSTRLEN];
@@ -81,7 +94,9 @@ static int add_route(const unsigned char *address, uint32_t ttl) {
  size_t i;
  for (i=0; i<route_count; i++) if (!strcmp(routes[i].ip, ip)) break;
  if (i == route_count) {
-  if (route_count == MAX_ROUTES || route_command("replace", ip)) return -1;
+  if (route_count >= route_limit && evict_expired()) return -1;
+  if (route_command("replace", ip)) return -1;
+  i = route_count;
   routes[route_count].expires=0;
   strcpy(routes[route_count++].ip, ip);
  }
@@ -90,15 +105,6 @@ static int add_route(const unsigned char *address, uint32_t ttl) {
  time_t expires = now() + ttl + 2;
  if (expires > routes[i].expires) routes[i].expires = expires;
  return 0;
-}
-
-static void expire_routes(void) {
- time_t t = now();
- for (size_t i=0; i<route_count;) {
-  if (routes[i].expires > t) { i++; continue; }
-  if (route_command("del", routes[i].ip)) { routes[i].expires = t + 5; i++; continue; }
-  routes[i] = routes[--route_count];
- }
 }
 
 /* 解码 DNS 名称，限制压缩指针跳数与输出长度。 */
@@ -285,6 +291,7 @@ int main(int argc, char **argv) {
   else if(!strcmp(argv[i],"--vpn-port"))vpn_port=atoi(argv[i+1]);
   else if(!strcmp(argv[i],"--local-port"))local_port=atoi(argv[i+1]);
   else if(!strcmp(argv[i],"--ip-tool"))ip_tool=argv[i+1];
+  else if(!strcmp(argv[i],"--max-routes")) { long n=strtol(argv[i+1],NULL,10); if(n<1 || n>MAX_ROUTES)return 2; route_limit=(size_t)n; }
   else return 2;
  }
  struct sockaddr_in vpn,local_dns;
@@ -306,7 +313,6 @@ int main(int argc, char **argv) {
  while(!stopping) {
   struct pollfd fds[2]={{udp,POLLIN,0},{tcp,POLLIN,0}};
   int ready=poll(fds,2,1000);
-  expire_routes();
   if(ready<=0)continue;
   if(fds[0].revents&POLLIN) {
    struct sockaddr_storage client;socklen_t len=sizeof(client);
