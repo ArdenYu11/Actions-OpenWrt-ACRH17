@@ -1,0 +1,8 @@
+# 编译时固定使用的 feeds 版本，固定模式下替换 lede 自带的 feeds.conf.default。
+# strongswan、xl2tpd 在 packages，网页界面在 luci，它们不随 lede.lock 固定，所以要单独锁。
+# 当前版本来自已验证固件 RT-ACRH17-20261105-2026。
+src-git packages https://github.com/coolsnowwolf/packages.git^970d7296e646918746df95396eb12e3a344668a0
+src-git luci https://github.com/coolsnowwolf/luci.git^04bdb60fc11343d62916c530422a8971ffa73d42
+src-git routing https://github.com/coolsnowwolf/routing.git^2d0f967bd6bd95d4c0d3c330e4713e79d75b4c54
+src-git telephony https://github.com/coolsnowwolf/telephony.git^d3bcb153813b1ff34b3dd0f1bf0dc913984f2921
+src-git helloworld https://github.com/fw876/helloworld.git^81c6320d40d455e6d623b6579f460d0665e1a421
