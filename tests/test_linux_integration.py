@@ -146,6 +146,16 @@ printf 'xl2tpd-control-ok\\n' >> "$TEST_TRACE"''',
         self.assertLess(trace.index('routing purge'), trace.index('resolving|'))
         self.assertFalse((self.runtime / 'ppp.up').exists())
 
+    def test_config_check_reason_is_logged(self):
+        (self.lib / 'ensure-config').write_text('#!/bin/sh\necho "防火墙配置有尚未提交的其他改动"\n'
+                                                'echo "第二行原因"\necho "重载输出" >&2\nexit 1\n')
+        self.start(TEST_RESOLVE_FAIL='1')
+        self.process.wait(timeout=8)
+        events = self.events()
+        self.assertIn('防火墙配置有尚未提交的其他改动', events)
+        self.assertIn('第二行原因', events)
+        self.assertNotIn('重载输出', events)
+
     @unittest.skipUnless(os.path.exists('/proc/self/comm'), '需要 Linux /proc 核对进程名')
     def test_orphaned_process_from_crashed_session_is_stopped(self):
         self.runtime.mkdir()

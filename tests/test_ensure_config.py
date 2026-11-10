@@ -5,6 +5,7 @@ import os
 import pathlib
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -14,7 +15,7 @@ SCRIPT = ROOT / 'packages/l2tp-ipsec-client/files/usr/lib/l2tp-ipsec-client/ensu
 # 读取时叠加所有暂存目录里同名配置的改动，默认暂存目录（/tmp/.uci）始终在其中；
 # -t 只改变新改动写到哪里；commit 把叠加后的结果写回配置文件，只清空当前暂存目录里的改动。
 FAKE_UCI = r'''#!/usr/bin/env python3
-import json, os, sys
+import fcntl, json, os, sys
 confdir, default_save = os.environ['FAKE_UCI_CONFDIR'], os.environ['FAKE_UCI_SAVEDIR']
 savedir, words, args = default_save, [], sys.argv[1:]
 while args:
@@ -59,7 +60,10 @@ def load(cfg):
     file = os.path.join(confdir, cfg)
     if not os.path.exists(file):
         sys.exit(1)
-    conf = json.load(open(file))
+    # 与 libuci 相同：读取时加共享锁
+    with open(file) as locked:
+        fcntl.flock(locked, fcntl.LOCK_SH)
+        conf = json.load(locked)
     for op in deltas(cfg):
         apply(conf, op)
     return conf
@@ -80,14 +84,23 @@ elif cmd in ('set', 'add_list', 'del_list', 'delete'):
 elif cmd == 'commit':
     cfg = rest[0]
     if deltas(cfg):
-        conf = load(cfg)
-        # 模拟提交期间别人改了原配置文件
-        race = os.environ.get('FAKE_UCI_RACE')
-        if race:
-            other = json.load(open(race))
-            other['racer'] = {'.type': 'rule'}
-            json.dump(other, open(race, 'w'), sort_keys=True)
-        json.dump(conf, open(os.path.join(confdir, cfg), 'w'), sort_keys=True)
+        path = os.path.join(confdir, cfg)
+        # 与 libuci 相同：打开配置文件后加排他锁，从这个打开的文件重新读取，写临时文件再改名替换
+        with open(path) as locked:
+            fcntl.flock(locked, fcntl.LOCK_EX)
+            conf = json.load(locked)
+            for op in deltas(cfg):
+                apply(conf, op)
+            # 模拟生成副本期间别人改了原配置文件
+            race = os.environ.get('FAKE_UCI_RACE')
+            if race:
+                other = json.load(open(race))
+                other['racer'] = {'.type': 'rule'}
+                json.dump(other, open(race, 'w'), sort_keys=True)
+            temp = os.path.join(confdir, '.' + cfg + '.uci-new')
+            with open(temp, 'w') as out:
+                json.dump(conf, out, sort_keys=True)
+            os.rename(temp, path)
         own = os.path.join(savedir, cfg)
         if os.path.exists(own):
             open(own, 'w').close()
@@ -96,6 +109,32 @@ elif cmd == 'changes':
         print(rest[0] + ': ' + json.dumps(op))
 else:
     sys.exit(2)
+'''
+
+# 与 busybox、util-linux 的「flock FD」相同：给继承来的描述符加锁，进程退出后锁仍归该描述符。
+FAKE_FLOCK = r'''#!/usr/bin/env python3
+import fcntl, sys
+mode, fd = fcntl.LOCK_EX, None
+for arg in sys.argv[1:]:
+    if arg == '-s':
+        mode = fcntl.LOCK_SH
+    elif arg.isdigit():
+        fd = int(arg)
+fcntl.flock(fd, mode)
+'''
+
+# 脚本最终核对原文件之后，立即由另一个操作提交 firewall.other.target=DROP。
+# 新进程先关掉继承来的 9 号描述符，否则会一直占着脚本的锁。
+RACE_CMP = '''#!/bin/sh
+/usr/bin/cmp "$@"
+rc=$?
+if [ -n "${RACE_AFTER_CMP:-}" ] && [ "$3" = "$RACE_AFTER_CMP" ] && mkdir "$RACE_DIR/started" 2>/dev/null; then
+	( exec 9<&-; uci set firewall.other.target=DROP && uci commit firewall; : > "$RACE_DIR/done" ) &
+	# 没有互斥时这次提交马上完成；有互斥时它要等写回结束，这里最多等 1 秒
+	i=0
+	while [ ! -e "$RACE_DIR/done" ] && [ "$i" -lt 10 ]; do sleep 0.1; i=$((i + 1)); done
+fi
+exit "$rc"
 '''
 
 
@@ -111,8 +150,9 @@ class EnsureConfigTests(unittest.TestCase):
         self.tempdir = self.dir / 'tmp'
         for path in (self.bin, self.initd, self.sysnet, self.confdir, self.savedir, self.tempdir):
             path.mkdir()
-        (self.bin / 'uci').write_text(FAKE_UCI)
-        (self.bin / 'uci').chmod(0o755)
+        for name, source in (('uci', FAKE_UCI), ('flock', FAKE_FLOCK), ('cmp', RACE_CMP)):
+            (self.bin / name).write_text(source)
+            (self.bin / name).chmod(0o755)
         self.trace = self.dir / 'trace'
         for name in ('network', 'firewall'):
             script = self.initd / name
@@ -144,8 +184,9 @@ class EnsureConfigTests(unittest.TestCase):
 
     def run_script(self, returncode=0, **env):
         result = subprocess.run(['sh', str(SCRIPT)], env={**self.env, **env}, capture_output=True, text=True)
-        self.assertEqual(result.returncode, returncode, result.stderr)
+        self.assertEqual(result.returncode, returncode, result.stdout + result.stderr)
         self.assertEqual(list(self.tempdir.iterdir()), [])
+        self.output = result.stdout
         reloads = self.trace.read_text().splitlines() if self.trace.exists() else []
         if self.trace.exists():
             self.trace.unlink()
@@ -202,29 +243,64 @@ class EnsureConfigTests(unittest.TestCase):
         self.assertEqual(len(self.staged('firewall')), 1)
         self.assertEqual(len(self.staged('network')), 1)
 
-    def test_commits_only_own_changes_while_others_are_pending(self):
+    def test_neither_commits_nor_applies_pending_changes_of_others(self):
+        # 插件配置缺失，同时有别人暂存的防火墙改动：重新加载会让它们提前生效，所以本次不写回、不重载
         self.write_state({'network': {'l2tpipsec': {'.type': 'interface', 'proto': 'none', 'device': 'l2tp-vpn'}},
                           'firewall': {'other': {'.type': 'rule', 'target': 'REJECT'}}})
         self.stage('set', 'firewall.other.target=ACCEPT')
         self.stage('set', 'network.lan=interface')
-        self.assertEqual(self.run_script(), ['network reload', 'firewall reload'])
+        self.assertEqual(self.run_script(1), [])
+        self.assertIn('uci changes firewall', self.output)
+        self.assertIn('uci changes network', self.output)
         config = self.config()
-        self.assertEqual(config['firewall']['other']['target'], 'REJECT')
-        self.assertEqual(config['firewall']['l2tpipsec']['.type'], 'zone')
-        self.assertNotIn('l2tpipsec', config['network'])
-        self.assertNotIn('lan', config['network'])
-        # 别人的改动仍在暂存区，读取时照常叠加
+        self.assertEqual(config['firewall'], {'other': {'.type': 'rule', 'target': 'REJECT'}})
+        self.assertIn('l2tpipsec', config['network'])
+        # 别人的改动仍在暂存区，由他们自己提交或放弃
         self.assertEqual(len(self.staged('firewall')), 1)
         self.assertEqual(len(self.staged('network')), 1)
-        self.assertEqual(subprocess.run(['uci', 'get', 'firewall.other.target'], env=self.env,
-                                        capture_output=True, text=True).stdout.strip(), 'ACCEPT')
+        # 放弃之后，下次连接补齐
+        for name in ('firewall', 'network'):
+            (self.savedir / name).unlink()
+        self.assertEqual(self.run_script(), ['network reload', 'firewall reload'])
+        self.assertEqual(self.config()['firewall']['l2tpipsec']['.type'], 'zone')
 
-    def test_does_not_overwrite_concurrent_commit(self):
+    def test_pending_changes_only_hold_back_their_own_config(self):
+        self.write_state({'network': {'l2tpipsec': {'.type': 'interface', 'proto': 'none', 'device': 'l2tp-vpn'}},
+                          'firewall': {}})
+        self.stage('set', 'network.lan=interface')
+        self.assertEqual(self.run_script(1), ['firewall reload'])
+        self.assertIn('uci changes network', self.output)
+        self.assertNotIn('uci changes firewall', self.output)
+        config = self.config()
+        self.assertEqual(config['firewall']['l2tpipsec']['.type'], 'zone')
+        self.assertIn('l2tpipsec', config['network'])
+
+    def test_does_not_overwrite_commit_made_while_preparing(self):
         firewall = self.confdir / 'firewall'
         self.assertEqual(self.run_script(1, FAKE_UCI_RACE=str(firewall)), [])
+        self.assertIn('firewall 配置在检查期间被其他操作修改', self.output)
         config = self.config()['firewall']
         self.assertIn('racer', config)
         self.assertNotIn('l2tpipsec', config)
+        self.assertEqual(list(self.confdir.glob('.*')), [])
+
+    def test_commit_after_final_check_waits_and_is_kept(self):
+        self.write_state({'firewall': {'other': {'.type': 'rule', 'target': 'REJECT'}}})
+        race = self.dir / 'race'
+        race.mkdir()
+        self.assertEqual(self.run_script(RACE_AFTER_CMP=str(self.confdir / 'firewall'), RACE_DIR=str(race)),
+                         ['firewall reload'])
+        self.assertTrue((race / 'started').exists())
+        deadline = time.monotonic() + 5
+        while not (race / 'done').exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue((race / 'done').exists())
+        # 另一个操作读取和提交都要等写回结束，基于写回后的文件提交，两边的改动都在
+        config = self.config()['firewall']
+        self.assertEqual(config['other']['target'], 'DROP')
+        self.assertEqual(config['l2tpipsec']['.type'], 'zone')
+        self.assertEqual(self.staged('firewall'), [])
+        self.assertEqual(self.run_script(), [])
         self.assertEqual(list(self.confdir.glob('.*')), [])
 
 

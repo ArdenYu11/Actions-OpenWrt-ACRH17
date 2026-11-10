@@ -3,10 +3,13 @@
 # 用旧备份恢复配置后也能自动补回。只补缺失的部分，不覆盖已有区域的策略选项；
 # 有实际改动才写回并重新加载。
 #
-# uci commit 会把 /tmp/.uci 里同名配置的全部暂存改动一起提交，包括其他操作暂存、还没决定应用的设置，
-# 换用 -t 指定的暂存目录也一样（/tmp/.uci 始终在 uci 的读取路径里）。所以改动在副本上做：
-# 副本换成 lp_ 开头的包名，读不到也提交不了别人对原配置的暂存改动；写回前核对原文件
-# 期间没被别人改过。别人的暂存改动原样留在 /tmp/.uci，仍等他们自己提交或放弃。
+# 其他操作用 uci set 暂存、还没决定应用的改动在 /tmp/.uci 里，本插件既不能提交它们，也不能让它们提前生效：
+# - uci commit 会把同名配置的全部暂存改动一起提交，换用 -t 指定的暂存目录也一样
+#   （/tmp/.uci 始终在 uci 的读取路径里）。所以改动在副本上做：副本换成 lp_ 开头的包名，
+#   读不到也提交不了别人的暂存改动。
+# - firewall4、netifd 重新加载时用默认方式读配置，同样会叠加 /tmp/.uci 里的改动。所以某个配置
+#   有别人的暂存改动时，本次不写回也不重载它，提交或放弃这些改动后下次连接再补。
+# 写回时与 uci commit 一样对配置文件加排他锁，核对和替换之间别人提交不进来。
 
 umask 077
 LP_IFACE=l2tp-vpn
@@ -46,20 +49,28 @@ set_option() {
 	[ "$(cfg get "lp_$1")" = "$2" ] || cfg set "lp_$1=$2"
 }
 
-# 提交副本并写回原文件。返回 0 表示已写回，1 表示没有改动，2 表示原文件期间被别人改过或写回失败。
+inode() {
+	ls -di "$1" 2>/dev/null | awk '{print $1}'
+}
+
+# 把副本写回原文件，成功返回 0；原文件期间被别人改过或写回失败返回 1。
+# uci commit 打开配置文件后加 flock 排他锁，再从这个文件重新读取、改名替换，这里用同一把锁。
+# 打开前先记下 inode：拿到锁时文件已被别人改名替换的话，锁住的是旧文件，挡不住后来的提交，放弃。
 publish() {
-	local target new
+	local target new before
 	target=$(config_path "$1")
 	new="${target%/*}/.$1.l2tpipsec-new"
-	cfg commit "lp_$1" || return 2
-	cmp -s "$work/lp_$1" "$work/$1.orig" && return 1
-	cmp -s "$work/$1.orig" "$target" || return 2
-	# 复制原文件保留权限，再换内容，最后改名替换
-	if cp -p "$target" "$new" && cat "$work/lp_$1" > "$new" && mv "$new" "$target"; then
-		return 0
-	fi
-	rm -f "$new"
-	return 2
+	before=$(inode "$target")
+	[ -n "$before" ] || return 1
+	(
+		# OpenWrt 的 busybox 默认带 flock；万一裁掉了，退回不加锁
+		if command -v flock >/dev/null; then flock -x 9 || exit 1; fi
+		[ "$(inode "$target")" = "$before" ] && cmp -s "$work/$1.orig" "$target" || exit 1
+		# 复制原文件保留权限，再换内容，最后改名替换
+		cp -p "$target" "$new" && cat "$work/lp_$1" > "$new" && mv "$new" "$target" && exit 0
+		rm -f "$new"
+		exit 1
+	) 9< "$target"
 }
 
 # 旧版本为 l2tp-vpn 建了 netifd 接口。netifd 接管 pppd 建出的网卡时会清空它的地址和路由，
@@ -116,16 +127,34 @@ if [ "$(cfg get lp_firewall.l2tpipsec_dns)" != rule ]; then
 	cfg set lp_firewall.l2tpipsec_dns.target=ACCEPT
 fi
 
+# 失败原因写到标准输出，由工作进程记进连接日志；重新加载的输出改走标准错误。
 result=0
 network_changed=0
 firewall_changed=0
-publish network
-case $? in 0) network_changed=1 ;; 2) result=1 ;; esac
-publish firewall
-case $? in 0) firewall_changed=1 ;; 2) result=1 ;; esac
+for name in network firewall; do
+	cfg commit "lp_$name" || { echo "无法生成 $name 配置。"; result=1; continue; }
+	cmp -s "$work/lp_$name" "$work/$name.orig" && continue
+	if [ -n "$(uci -q changes "$name")" ]; then
+		case "$name" in
+		network) echo '网络配置有尚未提交的其他改动（uci changes network），为免重新加载时让它们提前生效，本次未移除旧版留下的 network.l2tpipsec 接口。' ;;
+		firewall) echo '防火墙配置有尚未提交的其他改动（uci changes firewall），为免重新加载时让它们提前生效，本次未补齐 VPN 所需的防火墙配置，局域网设备可能无法经 VPN 访问。请先提交或放弃这些改动，再重新连接。' ;;
+		esac
+		result=1
+		continue
+	fi
+	if ! publish "$name"; then
+		echo "$name 配置在检查期间被其他操作修改，本次未写回，下次连接时再补齐。"
+		result=1
+		continue
+	fi
+	case "$name" in
+	network) network_changed=1 ;;
+	firewall) firewall_changed=1 ;;
+	esac
+done
 
 if [ "$1" != --no-reload ]; then
-	[ "$network_changed" = 0 ] || "$LP_INITD/network" reload
-	[ "$firewall_changed" = 0 ] || "$LP_INITD/firewall" reload
+	[ "$network_changed" = 0 ] || "$LP_INITD/network" reload >&2
+	[ "$firewall_changed" = 0 ] || "$LP_INITD/firewall" reload >&2
 fi
 exit "$result"
