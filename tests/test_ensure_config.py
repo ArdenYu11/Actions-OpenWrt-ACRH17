@@ -239,7 +239,7 @@ class EnsureConfigTests(unittest.TestCase):
                     'TEST_TRACE': str(self.trace), 'TEST_VIEW': str(self.view),
                     'RACE_DIR': str(self.race), 'RACE_AFTER_CMP': str(self.confdir / 'firewall'),
                     'LP_CONFDIR': str(self.confdir), 'LP_CONF2DIR': str(self.dir / 'var-run-uci'),
-                    'LP_UCI_SAVEDIR': str(self.savedir),
+                    'LP_UCI_SAVEDIR': str(self.savedir), 'LP_STATE_DIR': str(self.dir / 'run'),
                     'LP_INITD': str(self.initd), 'LP_SYSNET': str(self.sysnet), 'LP_UCI_FILE': str(self.dir / 'l2tpipsec')}
 
     def tearDown(self):
@@ -373,10 +373,32 @@ class EnsureConfigTests(unittest.TestCase):
         self.assertEqual(self.config()['firewall']['other']['target'], 'REJECT')
         self.assertEqual(len(self.staged('firewall')), 1)
 
-    def test_failed_isolated_reload_is_reported(self):
+    def test_failed_reload_is_retried_until_it_succeeds(self):
+        mark = self.dir / 'run' / 'firewall-reload-pending'
         self.assertEqual(self.run_script(1, FAKE_UNSHARE_FAIL='1'), [])
         self.assertIn('重新加载失败', self.output)
         self.assertEqual(self.config()['firewall']['l2tpipsec']['.type'], 'zone')
+        self.assertTrue(mark.exists())
+        # 配置文件已没有差异，仍按标记重试；再次失败标记保留
+        self.assertEqual(self.run_script(1, FAKE_UNSHARE_FAIL='1'), [])
+        self.assertTrue(mark.exists())
+        # 条件恢复后重新连接，补上重新加载并清掉标记
+        self.assertEqual(self.run_script(), ['firewall reload'])
+        self.assertFalse(mark.exists())
+        self.assertEqual(self.run_script(), [])
+
+    def test_reload_retry_waits_for_pending_changes_of_others(self):
+        mark = self.dir / 'run' / 'firewall-reload-pending'
+        self.write_state({'firewall': {'other': {'.type': 'rule', 'target': 'REJECT'}}})
+        self.run_script(1, FAKE_UNSHARE_FAIL='1')
+        self.stage('set', 'firewall.other.target=ACCEPT')
+        self.assertEqual(self.run_script(1), [])
+        self.assertIn('尚未生效', self.output)
+        self.assertTrue(mark.exists())
+        (self.savedir / 'firewall').unlink()
+        self.assertEqual(self.run_script(), ['firewall reload'])
+        self.assertEqual(self.view.read_text().splitlines(), ['REJECT'])
+        self.assertFalse(mark.exists())
 
     def test_does_not_overwrite_commit_made_while_preparing(self):
         firewall = self.confdir / 'firewall'
@@ -410,7 +432,7 @@ class EnsureConfigTests(unittest.TestCase):
         try:
             self.wait_for(self.race / 'paused')
             self.assertEqual(self.run_script(1, RACE_MODE='release'), [])
-            self.assertIn('正在提交', self.output)
+            self.assertIn('uci 提交尚未完成', self.output)
         finally:
             (self.race / 'go').touch()
             committer.wait(timeout=5)
@@ -421,14 +443,20 @@ class EnsureConfigTests(unittest.TestCase):
         self.assertEqual(config['other']['target'], 'DROP')
         self.assertEqual(config['l2tpipsec']['.type'], 'zone')
 
-    def test_stale_temp_file_from_crashed_commit_is_ignored(self):
-        stale = self.confdir / '.firewall.uci-abc123'
-        stale.write_text('{}')
+    def test_any_uci_temp_file_holds_back_and_is_reported(self):
+        # 不论多久以前写的，都可能是还没改名的提交（进程可能被暂停），一律不写回并写出路径
+        leftover = self.confdir / '.firewall.uci-abc123'
+        leftover.write_text('{}')
         old = time.time() - 300
-        os.utime(stale, (old, old))
+        os.utime(leftover, (old, old))
+        self.assertEqual(self.run_script(1), [])
+        self.assertIn(str(leftover), self.output)
+        self.assertNotIn('l2tpipsec', self.config()['firewall'])
+        # 另一份配置不受影响；删除残留文件后补齐
+        (self.confdir / '.network.uci-zzz').write_text('{}')
+        leftover.unlink()
         self.assertEqual(self.run_script(), ['firewall reload'])
         self.assertEqual(self.config()['firewall']['l2tpipsec']['.type'], 'zone')
-        stale.unlink()
 
     @unittest.skipUnless(REAL_UNSHARE, '需要 Linux 且允许普通用户建立挂载命名空间')
     def test_real_mount_namespace_hides_staged_changes(self):

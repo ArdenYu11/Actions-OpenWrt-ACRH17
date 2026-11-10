@@ -12,6 +12,7 @@
 #   检查之后别人仍可能再暂存：防火墙在独立的挂载命名空间里重新加载，把 /tmp/.uci 换成空目录，
 #   firewall4 只读到已提交的配置。netifd 是常驻进程，网络配置做不到这样的隔离。
 # 写回时与 uci commit 一样对配置文件加排他锁，并避开已放锁、还没改名的提交。
+# 写回后防火墙重新加载失败的，留下待重载标记，之后每次检查都重试，直到成功。
 
 umask 077
 LP_IFACE=l2tp-vpn
@@ -22,6 +23,9 @@ LP_UCI_FILE=${LP_UCI_FILE:-/etc/config/l2tpipsec}
 LP_CONFDIR=${LP_CONFDIR:-/etc/config}
 LP_CONF2DIR=${LP_CONF2DIR:-/var/run/uci}
 LP_UCI_SAVEDIR=${LP_UCI_SAVEDIR:-/tmp/.uci}
+# 运行目录在 tmpfs 上，重启后清空；开机时防火墙本来就按完整的已提交配置加载
+LP_STATE_DIR=${LP_STATE_DIR:-/var/run/l2tp-ipsec-client}
+LP_RELOAD_MARK="$LP_STATE_DIR/firewall-reload-pending"
 [ ! -f "$LP_UCI_FILE" ] || chmod 600 "$LP_UCI_FILE"
 
 work=$(mktemp -d "${TMPDIR:-/tmp}/l2tpipsec-config.XXXXXX") || exit 1
@@ -56,11 +60,12 @@ inode() {
 	ls -di "$1" 2>/dev/null | awk '{print $1}'
 }
 
-# 把副本写回原文件，成功返回 0；原文件期间被别人改过、有提交正在进行或写回失败返回 1。
+# 把副本写回原文件。返回 0 表示已写回；1 表示原文件期间被别人改过或写回失败；
+# 2 表示有 uci 提交尚未完成（原因已输出）。
 # uci commit 打开配置文件后加 flock 排他锁，重新读取并写好临时文件 .<配置名>.uci-XXXXXX，
 # 然后先关闭配置文件（锁随之释放）再把临时文件改名替换。这里用同一把锁，拿到锁后依次核对：
-# - 一分钟内的 .<配置名>.uci-* 临时文件：有提交已放锁、还没改名，等它完成，本次放弃。
-#   更早的临时文件是提交中途异常退出留下的，忽略。
+# - .<配置名>.uci-* 临时文件：有提交已放锁、还没改名，本次放弃。分不清它是进行中的提交，
+#   还是提交中途异常退出留下的（年龄、打开状态都看不出来），一律放弃并写出路径，残留的由人删除。
 # - inode：打开前记下的文件已被别人改名替换的话，锁住的是旧文件，挡不住后来的提交，放弃。
 # - 内容：生成副本之后别人提交过，放弃。
 publish() {
@@ -72,7 +77,11 @@ publish() {
 	(
 		# OpenWrt 的 busybox 默认带 flock；万一裁掉了，退回不加锁
 		if command -v flock >/dev/null; then flock -x 9 || exit 1; fi
-		[ -z "$(find "${target%/*}" -maxdepth 1 -name ".$1.uci-*" -mmin -1 2>/dev/null)" ] || exit 1
+		for pending in "${target%/*}/.$1.uci-"*; do
+			[ -e "$pending" ] || continue
+			echo "$1 配置有 uci 提交尚未完成（${pending}），本次未写回，下次连接时再补齐。若这个文件长时间存在，是提交中途异常退出留下的，删除后重新连接。"
+			exit 2
+		done
 		[ "$(inode "$target")" = "$before" ] && cmp -s "$work/$1.orig" "$target" || exit 1
 		# 复制原文件保留权限，再换内容，最后改名替换
 		cp -p "$target" "$new" && cat "$work/lp_$1" > "$new" && mv "$new" "$target" && exit 0
@@ -156,11 +165,16 @@ for name in network firewall; do
 		result=1
 		continue
 	fi
-	if ! publish "$name"; then
-		echo "$name 配置在检查期间被其他操作修改或正在提交，本次未写回，下次连接时再补齐。"
+	publish "$name"
+	case $? in
+	0) ;;
+	2) result=1; continue ;;
+	*)
+		echo "$name 配置在检查期间被其他操作修改，本次未写回，下次连接时再补齐。"
 		result=1
 		continue
-	fi
+		;;
+	esac
 	case "$name" in
 	network) network_changed=1 ;;
 	firewall) firewall_changed=1 ;;
@@ -177,9 +191,24 @@ reload_firewall() {
 
 if [ "$1" != --no-reload ]; then
 	[ "$network_changed" = 0 ] || "$LP_INITD/network" reload >&2
-	if [ "$firewall_changed" = 1 ] && ! reload_firewall >&2; then
-		echo '防火墙配置已写入，但重新加载失败，暂未生效（详见 logread -e firewall）。若 uci changes firewall 列出暂存改动，请先处理，再执行 /etc/init.d/firewall reload。'
-		result=1
+	# 之前写回后重新加载失败的，这次重试。配置文件已经没有差异，只能靠标记知道还没生效。
+	# 有别人的暂存改动时同样先不加载：隔离加载会冲掉他们手动重新加载过、尚未提交的设置。
+	if [ "$firewall_changed" = 0 ] && [ -f "$LP_RELOAD_MARK" ]; then
+		if [ -n "$(uci -q changes firewall)" ]; then
+			echo 'VPN 所需的防火墙配置已写入但尚未生效；防火墙有尚未提交的其他改动（uci changes firewall），本次不重新加载，请先提交或放弃这些改动，再重新连接。'
+			result=1
+		else
+			firewall_changed=1
+		fi
+	fi
+	if [ "$firewall_changed" = 1 ]; then
+		if reload_firewall >&2; then
+			rm -f "$LP_RELOAD_MARK"
+		else
+			mkdir -p "$LP_STATE_DIR" && : > "$LP_RELOAD_MARK"
+			echo '防火墙配置已写入，但重新加载失败，暂未生效（详见 logread -e firewall），下次连接时会再试。'
+			result=1
+		fi
 	fi
 fi
 exit "$result"
