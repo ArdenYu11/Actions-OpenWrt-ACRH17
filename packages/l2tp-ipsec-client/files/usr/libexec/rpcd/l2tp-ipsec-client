@@ -1,0 +1,110 @@
+#!/bin/sh
+
+. /usr/lib/l2tp-ipsec-client/common.sh
+. /usr/share/libubox/jshn.sh
+umask 077
+
+reply() {
+	json_init
+	json_add_boolean ok "$1"
+	json_add_string message "$2"
+	json_dump
+}
+
+running() {
+	[ -f "$LP_DIR/worker.pid" ] || return 1
+	read -r worker_pid < "$LP_DIR/worker.pid"
+	case "$worker_pid" in ''|*[!0-9]*) return 1 ;; esac
+	lp_alive "$worker_pid"
+}
+
+wait_stopped() {
+	local tries=0
+	# procd 停止服务时最多等 15 秒才强制结束，这里多等一会儿
+	while running && [ "$tries" -lt 80 ]; do
+		sleep 0.2
+		tries=$((tries + 1))
+	done
+	! running
+}
+
+case "$1" in
+list)
+	printf '%s\n' '{"status":{},"logs":{},"validate":{},"start":{},"stop":{}}'
+;;
+call)
+	lp_load
+	case "$2" in
+	validate)
+		if lp_validate; then reply 1 '配置检查通过。'; else reply 0 "$LP_ERROR"; fi
+	;;
+	start)
+		if ! lp_validate; then reply 0 "$LP_ERROR"; exit 0; fi
+		/etc/init.d/l2tp-ipsec-client stop >/dev/null 2>&1
+		if ! wait_stopped; then reply 0 '旧连接仍在停止，请稍后重试。'; exit 0; fi
+		mkdir -p "$LP_DIR"
+		rmdir "$LP_DIR/lock" 2>/dev/null
+		if /etc/init.d/l2tp-ipsec-client start >/dev/null 2>&1; then
+			reply 1 '已开始连接，请查看连接状态。'
+		else reply 0 '连接管理进程启动失败。'; fi
+	;;
+	stop)
+		/etc/init.d/l2tp-ipsec-client stop >/dev/null 2>&1
+		if wait_stopped; then reply 1 '连接已停止。'; else reply 0 '连接正在停止。'; fi
+	;;
+	status)
+		if [ -f "$LP_DIR/status.json" ]; then json_load "$(cat "$LP_DIR/status.json")"; else
+			json_init
+			json_add_string phase disconnected
+			json_add_string message '尚未连接。'
+		fi
+		json_get_var phase phase
+		active=0; ipsec=0; ppp=0
+		running && active=1
+		[ "$active" = 1 ] && lp_has_ipsec && ipsec=1
+		[ -f "$LP_DIR/ppp.up" ] && [ -d /sys/class/net/l2tp-vpn ] && ppp=1
+		if [ "$phase" = connected ] && { [ "$ipsec" = 0 ] || [ "$ppp" = 0 ]; }; then
+			phase=error
+			json_add_string phase "$phase"
+			json_add_string message '连接已中断，正在更新状态。'
+		fi
+		json_add_boolean running "$active"
+		json_add_boolean ipsec "$ipsec"
+		json_add_boolean ppp "$ppp"
+		json_add_string interface l2tp-vpn
+		address=$(ip -4 -o address show dev l2tp-vpn 2>/dev/null | awk '{print $4}')
+		json_add_string address "$address"
+		json_add_string probe_ip "$probe_ip"
+		json_add_string routing_mode "${routing_mode:-rules}"
+		LP_PROBE_REACH=unknown; LP_PROBE_ADDRESS=""
+		if [ "$phase" = connected ] && [ "$ipsec" = 1 ] && [ "$ppp" = 1 ]; then lp_probe; fi
+		json_add_string reachable "$LP_PROBE_REACH"
+		json_add_string probe_address "$LP_PROBE_ADDRESS"
+		json_dump
+	;;
+	logs)
+		# 只返回管理事件和固定诊断，不把底层身份信息暴露到网页。
+		log=$(tail -n 100 "$LP_DIR/events.log" 2>/dev/null)
+		if [ -f "$LP_DIR/charon.log" ]; then
+			grep -q 'AUTHENTICATION_FAILED' "$LP_DIR/charon.log" && log="$log
+IPsec 诊断：远端拒绝认证（AUTHENTICATION_FAILED）。"
+			grep -q 'NO_PROPOSAL_CHOSEN' "$LP_DIR/charon.log" && log="$log
+IPsec 诊断：双方加密算法不匹配（NO_PROPOSAL_CHOSEN）。"
+			grep -q 'giving up after' "$LP_DIR/charon.log" && log="$log
+IPsec 诊断：服务器未响应，请检查地址、防火墙和 UDP 500/4500。"
+		fi
+		if [ -s "$LP_DIR/l2tp.log" ]; then
+			log="$log
+$(tail -n 5 "$LP_DIR/l2tp.log" | sed 's/^/L2TP 诊断：/')"
+		fi
+		if [ -s "$LP_DIR/dns.log" ]; then
+			log="$log
+$(tail -n 10 "$LP_DIR/dns.log")"
+		fi
+		json_init; json_add_string log "${log:-暂无连接日志。}"; json_dump
+	;;
+	*) reply 0 '未知操作。' ;;
+	esac
+;;
+*) exit 1 ;;
+esac

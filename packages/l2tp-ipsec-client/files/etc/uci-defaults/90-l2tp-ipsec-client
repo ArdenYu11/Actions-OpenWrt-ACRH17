@@ -1,0 +1,26 @@
+#!/bin/sh
+
+umask 077
+chmod 600 /etc/config/l2tpipsec
+
+# 无远端配置的默认服务不应抢占管理实例的端口。
+# 已配置的服务保留，连接时由管理实例提示冲突。
+if ! uci -q show ipsec | grep -q '=remote' &&
+	! grep -Eq '^[[:space:]]*[^#[:space:]]' /etc/swanctl/conf.d/*.conf 2>/dev/null &&
+	! grep -Eq '^[[:space:]]*(connections|pools|secrets|authorities)[[:space:]]*\{' /etc/swanctl/swanctl.conf; then
+	/etc/init.d/swanctl disable
+	[ -n "$IPKG_INSTROOT" ] || /etc/init.d/swanctl stop
+fi
+if ! grep -Eq '^[[:space:]]*\[(lac|lns)[[:space:]]' /etc/xl2tpd/xl2tpd.conf; then
+	/etc/init.d/xl2tpd disable
+	[ -n "$IPKG_INSTROOT" ] || /etc/init.d/xl2tpd stop
+fi
+
+# 由 UCI 开关决定是否在开机时连接，初始配置默认关闭。
+/etc/init.d/l2tp-ipsec-client enable
+
+# 防火墙配置交给可重复执行的检查脚本；开机和每次连接前还会再检查，
+# 用旧备份恢复配置后也能自动补回。
+/usr/lib/l2tp-ipsec-client/ensure-config
+[ -n "$IPKG_INSTROOT" ] || /etc/init.d/rpcd restart
+exit 0

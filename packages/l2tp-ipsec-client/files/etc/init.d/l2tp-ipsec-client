@@ -1,0 +1,29 @@
+#!/bin/sh /etc/rc.common
+
+START=95
+STOP=10
+USE_PROCD=1
+
+boot() {
+	# 开机时补齐防火墙配置，此时还没有 VPN 连接
+	/usr/lib/l2tp-ipsec-client/ensure-config
+	. /lib/functions.sh
+	config_load l2tpipsec
+	config_get_bool enabled main enabled 0
+	[ "$enabled" = 1 ] && start
+	return 0
+}
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /usr/lib/l2tp-ipsec-client/worker
+	procd_set_param term_timeout 15
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	# 清理由工作进程执行，避免停止其他 VPN 实例。
+	:
+}

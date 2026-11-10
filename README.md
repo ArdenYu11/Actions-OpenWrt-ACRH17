@@ -4,22 +4,35 @@
 
 ## 编译
 
-Actions → **Build RT-ACRH17 (lede)** → Run workflow。首次编译约 2–3 小时。
+Actions → **Build RT-ACRH17 (lede)** → Run workflow。选择分支，并设置「编译成功后发布 Release」（默认关闭）。首次编译约 2–3 小时。
 
-编译成功后固件在两处：
-- Releases：每次编译成功都会自动发布一个
-- 这次运行页面底部的 Artifacts
+编译成功后，固件始终上传到这次运行页面底部的 Artifacts；只有开启发布选项，才会同时创建 Release。验证构建保持发布选项关闭，下载附件验收后再决定发布。
+
+### 固定 lede 版本
+
+默认按 `lede.lock`（lede 提交）和 `feeds.lock`（packages、luci 等 feeds 的提交）编译，每次编出来的源码都一样，不会被 lede 当天的更新影响。strongswan、xl2tpd、LuCI 都在 feeds 里，所以两个文件都要锁。
+
+想试新版 lede 时：
+
+1. Run workflow 时把「lede 源码版本」选成 `latest`，编译最新代码
+2. 刷到路由器上，按 [tests/VALIDATION.md](tests/VALIDATION.md) 验证 VPN 等功能
+3. 没问题的话，把这次产物里的 `lede.lock`、`feeds.lock` 拷到仓库根目录覆盖并提交，之后的默认编译就固定在这个版本
+
+有问题就不用管，默认编译仍然用原来固定的版本。每次编译的产物里都带这两个文件，记录的是这次实际用到的版本。
 
 ## 文件说明
 
 | 文件 | 作用 |
 | --- | --- |
 | `acrh17.config` | 机型和软件包配置，需要的包追加 `CONFIG_PACKAGE_xxx=y` |
+| `lede.lock`、`feeds.lock` | 默认编译固定使用的 lede 和 feeds 版本，见「固定 lede 版本」 |
 | `diy-part1.sh` | 更新 feeds 前执行，增删 feeds 源 |
 | `diy-part2.sh` | 安装 feeds 后执行，改默认 IP 等 |
 | `files/` | 里面的文件原样放进固件根目录，例如 `files/etc/uci-defaults/` 下的脚本会在首次开机时执行 |
 
 lede 里 RT-ACRH17 和 RT-AC42U 共用 `asus_rt-ac42u` 定义，所以固件文件名里是 `asus_rt-ac42u`。
+
+已集成可独立维护的 L2TP/IPsec 客户端插件，在「VPN → L2TP/IPsec 客户端」统一填写服务器、账号密码和 PSK。通过一个编译配置项自动带入依赖，配置和预览方法见 [插件说明](packages/README.md)。
 
 硬件是 IPQ4019 + 256 MB 内存 + 128 MB NAND，Docker、AdGuardHome 这类重型插件跑起来会很吃力，插件别贪多。
 
