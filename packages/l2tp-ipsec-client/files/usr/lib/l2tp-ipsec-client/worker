@@ -179,8 +179,9 @@ if ! lp_validate; then
 fi
 lp_cleanup_leftovers
 # 每次连接前补齐防火墙配置，恢复旧备份后也能自动补回
-if [ -x "$LP_LIB/ensure-config" ] && ! "$LP_LIB/ensure-config" >/dev/null 2>&1; then
-	lp_log '防火墙配置检查失败，局域网设备可能无法经 VPN 访问。'
+if [ -x "$LP_LIB/ensure-config" ] && ! config_error=$("$LP_LIB/ensure-config" 2>/dev/null); then
+	[ -n "$config_error" ] || config_error='防火墙配置检查失败，局域网设备可能无法经 VPN 访问。'
+	printf '%s\n' "$config_error" | while IFS= read -r line; do lp_log "$line"; done
 fi
 lp_retry_reset
 while :; do
