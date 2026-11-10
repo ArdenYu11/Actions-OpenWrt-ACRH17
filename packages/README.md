@@ -46,7 +46,7 @@ CONFIG_PACKAGE_luci-app-l2tp-ipsec-client=y
 
 域名匹配不区分大小写，不填写协议、端口、路径或通配符。后缀按域名标签边界匹配。总域名规则上限 512 条，动态 IPv4 地址上限 4096 个。
 
-域名规则通过 DNS 解析结果学习 IPv4 路由。LAN 设备需要使用路由器 DNS；DoH/DoT、自定义外部 DNS、连接前已缓存的地址及直接用 IP 访问不会触发域名匹配。匹配域名不返回 AAAA、HTTPS/SVCB 地址提示和 ANY 结果，实际访问使用 IPv4。共享同一 IP 的其他域名也可能走 VPN。学到的地址在整个连接期间保留、断开时统一清理，所以 SSH 等长连接不会因为 DNS 有效期到了而中断；地址数达到上限时，只回收 DNS 有效期已过的地址。
+域名规则通过 DNS 解析结果学习 IPv4 路由。LAN 设备需要使用路由器 DNS；DoH/DoT、自定义外部 DNS、连接前已缓存的地址及直接用 IP 访问不会触发域名匹配。匹配域名不返回 AAAA、HTTPS/SVCB 地址提示和 ANY 结果，实际访问使用 IPv4。共享同一 IP 的其他域名也可能走 VPN。学到的地址在整个连接期间保留、断开时统一清理，所以 SSH 等长连接不会因为 DNS 有效期到了而中断；地址数达到上限时，只回收 DNS 有效期已过的地址。学到的地址同时记在运行目录的 `learned-routes` 里，连接期间路由被系统清掉时按它原地补回。
 
 DNS 模块接收发往路由器的 LAN DNS 请求和发往 `127.0.0.1` / `::1` 的本机 DNS 请求；命中规则使用 VPN DNS，未命中转给原 DNS 服务，保留其 DHCP、本地域名和解析策略。不会修改 dnsmasq 的持久配置或关闭其重绑定保护。全流量的 DNS 全部使用 VPN DNS。若装有其他 DNS 接管或策略路由插件，需要在真机验证规则顺序。
 
@@ -57,9 +57,9 @@ LAN → VPN 已配置转发和地址伪装，远端主动访问 LAN 默认不允
 - 持久配置：`/etc/config/l2tpipsec`，权限 600，凭据在刷机后填写。
 - 临时运行文件：`/var/run/l2tp-ipsec-client/`，目录权限 700；断开后删除包含 PSK/密码的协议配置。
 - 接口：`l2tp-vpn`，防火墙区域 `l2tpipsec` 直接按网卡名匹配。不建 netifd 逻辑接口：netifd 接管 pppd 建的网卡时会清空它的地址和路由。旧版本留下的 `network.l2tpipsec` 会在未连接时自动移除。
-- 配置自愈：`/usr/lib/l2tp-ipsec-client/ensure-config` 在首次安装、开机和每次连接前检查防火墙区域、LAN 转发、nft 规则和 DNS 放行规则，缺什么补什么，不覆盖已有区域的策略选项，有改动才重新加载防火墙。用旧备份恢复配置后，下次连接会自动补回。
+- 配置自愈：`/usr/lib/l2tp-ipsec-client/ensure-config` 在首次安装、开机和每次连接前检查防火墙区域、LAN 转发、nft 规则和 DNS 放行规则，缺什么补什么，不覆盖已有区域的策略选项，有改动才重新加载防火墙。用旧备份恢复配置后，下次连接会自动补回。改动在配置副本上做，只写回本插件的修改：其他操作用 `uci set` 暂存、尚未提交的改动不会被一起提交，仍留在暂存区；写回前原文件被别人改过时放弃写回，下次再补。
 - 日志：页面「连接日志」即 `/var/run/l2tp-ipsec-client/events.log`，并附带 IPsec 诊断和 `xl2tpd-control` 输出（`l2tp.log`）；xl2tpd、pppd 的详细日志用 `logread -e xl2tpd`、`logread -e pppd` 查看。
-- 路由：独立表 `41717`，IPv4 规则优先级 `10100`–`10104`；占用时拒绝启动，不覆盖其他管理器。
+- 路由：独立表 `41717`，IPv4 规则优先级 `10100`–`10104`；占用时拒绝启动，不覆盖其他管理器。本插件加的规则逐条记在运行目录的 `routing-rules` 里，断开和下次连接前的残留清理都只按记录删除；没有记录的规则和表内路由无法确认归属，一律保留。
 - DNS：双栈监听 `1053`，nftables 限制为 LAN/本机访问；使用表内专用路由访问 VPN DNS。
 - 进程管理：`/etc/init.d/l2tp-ipsec-client start|stop`。
 - 状态：`ubus call l2tp-ipsec-client status '{}'`。

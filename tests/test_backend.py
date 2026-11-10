@@ -6,10 +6,19 @@ import shlex
 import stat
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COMMON = ROOT / 'packages/l2tp-ipsec-client/files/usr/lib/l2tp-ipsec-client/common.sh'
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 class BackendTests(unittest.TestCase):
@@ -110,6 +119,31 @@ class BackendTests(unittest.TestCase):
     def test_domain_rule_limit(self):
         value = ' '.join('example.com' for _ in range(513))
         self.assertNotEqual(self.run_shell(f'domains={shlex.quote(value)}\nlp_validate').returncode, 0)
+
+    def test_ipsec_query_timeout_stops_swanctl_itself(self):
+        with tempfile.TemporaryDirectory() as temp:
+            target = pathlib.Path(temp)
+            bindir = target / 'bin'
+            bindir.mkdir()
+            # 模拟 charon 卡住、swanctl 一直等回复；exec 后 PID 不变，记下的就是实际在跑的进程
+            swanctl = bindir / 'swanctl'
+            swanctl.write_text(f'#!/bin/sh\necho "$$" > {shlex.quote(str(target / "pid"))}\nexec sleep 30\n')
+            swanctl.chmod(0o755)
+            started = time.monotonic()
+            result = self.run_shell(f'PATH={shlex.quote(str(bindir))}:$PATH\n'
+                                    'lp_has_ipsec; echo "rc=$? command_pid=$command_pid"', target)
+            self.assertIn('rc=1 command_pid=\n', result.stdout)
+            self.assertLess(time.monotonic() - started, 9)
+            pid = int((target / 'pid').read_text())
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and alive(pid):
+                time.sleep(0.05)
+            self.assertFalse(alive(pid), '超时后 swanctl 仍在运行')
+            self.assertEqual(list(target.glob('sas.*')), [])
+            # 正常返回时照常读到输出
+            swanctl.write_text('#!/bin/sh\necho "l2tpipsec: #1, ESTABLISHED"\necho "l2tpipsec: #2, reqid 1, INSTALLED"\n')
+            ok = self.run_shell(f'PATH={shlex.quote(str(bindir))}:$PATH\nlp_has_ipsec; echo "rc=$?"', target)
+            self.assertIn('rc=0', ok.stdout)
 
     def test_syntax_and_json(self):
         import json

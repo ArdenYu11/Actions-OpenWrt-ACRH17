@@ -25,6 +25,7 @@ static struct rule rules[MAX_RULES];
 static struct route routes[MAX_ROUTES];
 static size_t rule_count, route_count, route_limit = MAX_ROUTES;
 static const char *ip_tool = "/sbin/ip";
+static const char *learned_file;
 static volatile sig_atomic_t stopping;
 static unsigned int socket_mark;
 static long long io_deadline;
@@ -74,14 +75,31 @@ static int route_command(const char *action, const char *ip) {
  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
 }
 
-/* 表满时腾出一个 DNS 有效期已过的位置，选过期最早的。有效期内的地址不动。 */
+/* 已学到的地址写进记录文件，连接检查和原地恢复路由时按它核对、补回。
+ * 先写临时文件再改名，读的一方不会看到写了一半的文件。 */
+static void save_learned(void) {
+ if (!learned_file) return;
+ char temp[4096];
+ if (snprintf(temp, sizeof(temp), "%s.new", learned_file) >= (int)sizeof(temp)) return;
+ FILE *f = fopen(temp, "w");
+ int failed = !f;
+ for (size_t i=0; f && i<route_count; i++) if (fprintf(f, "%s\n", routes[i].ip) < 0) failed = 1;
+ if (f && fclose(f)) failed = 1;
+ if (failed || rename(temp, learned_file)) { unlink(temp); fputs("域名路由记录写入失败。\n", stderr); }
+}
+
+/* 表满时腾出一个 DNS 有效期已过的位置，选过期最早的。有效期内的地址不动。
+ * 先从记录里去掉再删路由，检查时不会把正在回收的地址当成丢失。 */
 static int evict_expired(void) {
  time_t t = now();
  size_t oldest = route_count;
  for (size_t i=0; i<route_count; i++)
   if (routes[i].expires <= t && (oldest == route_count || routes[i].expires < routes[oldest].expires)) oldest = i;
- if (oldest == route_count || route_command("del", routes[oldest].ip)) return -1;
+ if (oldest == route_count) return -1;
+ struct route removed = routes[oldest];
  routes[oldest] = routes[--route_count];
+ save_learned();
+ if (route_command("del", removed.ip)) { routes[route_count++] = removed; save_learned(); return -1; }
  return 0;
 }
 
@@ -99,6 +117,7 @@ static int add_route(const unsigned char *address, uint32_t ttl) {
   i = route_count;
   routes[route_count].expires=0;
   strcpy(routes[route_count++].ip, ip);
+  save_learned();
  }
  if (ttl < 1) ttl = 1;
  if (ttl > 86400) ttl = 86400;
@@ -291,6 +310,7 @@ int main(int argc, char **argv) {
   else if(!strcmp(argv[i],"--vpn-port"))vpn_port=atoi(argv[i+1]);
   else if(!strcmp(argv[i],"--local-port"))local_port=atoi(argv[i+1]);
   else if(!strcmp(argv[i],"--ip-tool"))ip_tool=argv[i+1];
+  else if(!strcmp(argv[i],"--learned"))learned_file=argv[i+1];
   else if(!strcmp(argv[i],"--max-routes")) { long n=strtol(argv[i+1],NULL,10); if(n<1 || n>MAX_ROUTES)return 2; route_limit=(size_t)n; }
   else return 2;
  }
@@ -309,6 +329,8 @@ int main(int argc, char **argv) {
  if(udp<0 || tcp<0 || bind(udp,(struct sockaddr *)&local,local_size) || bind(tcp,(struct sockaddr *)&local,local_size) || listen(tcp,8))return 1;
  unsigned char *query=malloc(PACKET),*reply=malloc(PACKET);
  if(!query || !reply)return 1;
+ /* 新进程还没学到地址，旧记录作废 */
+ if(learned_file)unlink(learned_file);
  if(ready_file) { FILE *f=fopen(ready_file,"w");if(!f)return 1;fclose(f); }
  while(!stopping) {
   struct pollfd fds[2]={{udp,POLLIN,0},{tcp,POLLIN,0}};
@@ -335,6 +357,8 @@ int main(int argc, char **argv) {
    close(client);
   }
  }
+ /* 先删记录再删路由，同上 */
+ if(learned_file)unlink(learned_file);
  for(size_t i=0;i<route_count;i++)route_command("del",routes[i].ip);
  if(ready_file)unlink(ready_file);
  close(udp);close(tcp);free(query);free(reply);return 0;

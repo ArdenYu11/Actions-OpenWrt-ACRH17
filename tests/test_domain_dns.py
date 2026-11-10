@@ -214,15 +214,39 @@ class DomainDnsTests(unittest.TestCase):
             name = '.'.join(part.decode() for part in self.labels(data[12:]))
             return DnsServer.answer(data, addresses[name], ttls[name])
         self.vpn.handler = reply
-        self.start(extra=('--max-routes', '1'))
+        learned = self.dir / 'learned'
+        self.start(extra=('--max-routes', '1', '--learned', str(learned)))
         self.assertEqual(self.ask('api.one.net')[-4:], socket.inet_aton('10.20.3.1'))
+        self.assertEqual(learned.read_text(), '10.20.3.1\n')
         time.sleep(3.5)
         self.assertEqual(self.ask('api.two.net')[-4:], socket.inet_aton('10.20.3.2'))
         trace = self.trace.read_text()
         self.assertIn('del 10.20.3.1', trace)
         self.assertIn('replace 10.20.3.2', trace)
+        self.assertEqual(learned.read_text(), '10.20.3.2\n')
         self.assertEqual(self.ask('api.three.net')[3] & 15, 2)
         self.assertNotIn('del 10.20.3.2', self.trace.read_text())
+        self.assertEqual(learned.read_text(), '10.20.3.2\n')
+
+    def test_learned_file_follows_process_lifetime(self):
+        learned = self.dir / 'learned'
+        learned.write_text('10.99.0.1\n')
+        self.start(extra=('--learned', str(learned)))
+        # 新进程启动时旧记录作废
+        self.assertFalse(learned.exists())
+        self.ask('api.one.net')
+        self.ask('exact.example.com')
+        self.ask('www.other.net')
+        self.assertEqual(learned.read_text(), '10.20.1.2\n')
+        self.vpn.address = '10.20.1.5'
+        self.ask('internal-app.example.org')
+        self.assertEqual(learned.read_text().splitlines(), ['10.20.1.2', '10.20.1.5'])
+        self.assertEqual(list(self.dir.glob('learned.*')), [])
+        self.process.terminate()
+        self.process.communicate(timeout=5)
+        self.process = None
+        self.assertFalse(learned.exists())
+        self.assertIn('del 10.20.1.5', self.trace.read_text())
 
     @staticmethod
     def labels(data):
