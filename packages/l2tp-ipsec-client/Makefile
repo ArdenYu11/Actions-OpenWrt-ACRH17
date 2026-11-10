@@ -18,7 +18,7 @@ define Package/l2tp-ipsec-client
 	+strongswan-mod-openssl +strongswan-mod-kernel-netlink \
 	+strongswan-mod-socket-default +strongswan-mod-vici \
 	+xl2tpd +ppp +ppp-mod-pppol2tp +ip-full +resolveip +rpcd +jshn \
-	+firewall4 +kmod-nft-xfrm +kmod-nft-nat
+	+firewall4 +kmod-nft-xfrm +kmod-nft-nat +unshare
 endef
 
 define Package/l2tp-ipsec-client/conffiles
