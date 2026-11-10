@@ -1,7 +1,12 @@
 #!/bin/sh
 # 检查并补齐本插件依赖的防火墙配置。首次安装、开机和每次连接前都会调用，
 # 用旧备份恢复配置后也能自动补回。只补缺失的部分，不覆盖已有区域的策略选项；
-# 有实际改动才重新加载防火墙。
+# 有实际改动才写回并重新加载。
+#
+# uci commit 会把 /tmp/.uci 里同名配置的全部暂存改动一起提交，包括其他操作暂存、还没决定应用的设置，
+# 换用 -t 指定的暂存目录也一样（/tmp/.uci 始终在 uci 的读取路径里）。所以改动在副本上做：
+# 副本换成 lp_ 开头的包名，读不到也提交不了别人对原配置的暂存改动；写回前核对原文件
+# 期间没被别人改过。别人的暂存改动原样留在 /tmp/.uci，仍等他们自己提交或放弃。
 
 umask 077
 LP_IFACE=l2tp-vpn
@@ -9,45 +14,83 @@ LP_IFACE=l2tp-vpn
 LP_INITD=${LP_INITD:-/etc/init.d}
 LP_SYSNET=${LP_SYSNET:-/sys/class/net}
 LP_UCI_FILE=${LP_UCI_FILE:-/etc/config/l2tpipsec}
+LP_CONFDIR=${LP_CONFDIR:-/etc/config}
+LP_CONF2DIR=${LP_CONF2DIR:-/var/run/uci}
 [ ! -f "$LP_UCI_FILE" ] || chmod 600 "$LP_UCI_FILE"
+
+work=$(mktemp -d "${TMPDIR:-/tmp}/l2tpipsec-config.XXXXXX") || exit 1
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/save" || exit 1
+
+# uci 优先使用 /var/run/uci 下的同名配置
+config_path() {
+	if [ -f "$LP_CONF2DIR/$1" ]; then
+		printf '%s\n' "$LP_CONF2DIR/$1"
+	else
+		printf '%s\n' "$LP_CONFDIR/$1"
+	fi
+}
+
+for name in network firewall; do
+	cp "$(config_path "$name")" "$work/$name.orig" || exit 1
+	cp "$work/$name.orig" "$work/lp_$name" || exit 1
+done
+
+# 只操作副本，暂存也写在临时目录里
+cfg() {
+	uci -q -c "$work" -t "$work/save" "$@"
+}
 
 # 值不同才写，避免产生无意义的改动
 set_option() {
-	[ "$(uci -q get "$1")" = "$2" ] || uci set "$1=$2"
+	[ "$(cfg get "lp_$1")" = "$2" ] || cfg set "lp_$1=$2"
 }
 
-network_changed=0
+# 提交副本并写回原文件。返回 0 表示已写回，1 表示没有改动，2 表示原文件期间被别人改过或写回失败。
+publish() {
+	local target new
+	target=$(config_path "$1")
+	new="${target%/*}/.$1.l2tpipsec-new"
+	cfg commit "lp_$1" || return 2
+	cmp -s "$work/lp_$1" "$work/$1.orig" && return 1
+	cmp -s "$work/$1.orig" "$target" || return 2
+	# 复制原文件保留权限，再换内容，最后改名替换
+	if cp -p "$target" "$new" && cat "$work/lp_$1" > "$new" && mv "$new" "$target"; then
+		return 0
+	fi
+	rm -f "$new"
+	return 2
+}
+
 # 旧版本为 l2tp-vpn 建了 netifd 接口。netifd 接管 pppd 建出的网卡时会清空它的地址和路由，
 # 所以改为直接在防火墙区域里写网卡名，这里移除旧接口。连接中不动，避免当场把 VPN 清空。
-if [ "$(uci -q get network.l2tpipsec.proto)" = none ] &&
-	[ "$(uci -q get network.l2tpipsec.device)" = "$LP_IFACE" ] &&
+if [ "$(cfg get lp_network.l2tpipsec.proto)" = none ] &&
+	[ "$(cfg get lp_network.l2tpipsec.device)" = "$LP_IFACE" ] &&
 	[ ! -d "$LP_SYSNET/$LP_IFACE" ]; then
-	uci -q delete network.l2tpipsec
-	uci commit network
-	network_changed=1
+	cfg delete lp_network.l2tpipsec
 fi
 
-if [ "$(uci -q get firewall.l2tpipsec)" != zone ]; then
-	uci set firewall.l2tpipsec=zone
-	uci set firewall.l2tpipsec.name=l2tpipsec
-	uci set firewall.l2tpipsec.input=REJECT
-	uci set firewall.l2tpipsec.output=ACCEPT
-	uci set firewall.l2tpipsec.forward=REJECT
-	uci set firewall.l2tpipsec.masq=1
-	uci set firewall.l2tpipsec.mtu_fix=1
+if [ "$(cfg get lp_firewall.l2tpipsec)" != zone ]; then
+	cfg set lp_firewall.l2tpipsec=zone
+	cfg set lp_firewall.l2tpipsec.name=l2tpipsec
+	cfg set lp_firewall.l2tpipsec.input=REJECT
+	cfg set lp_firewall.l2tpipsec.output=ACCEPT
+	cfg set lp_firewall.l2tpipsec.forward=REJECT
+	cfg set lp_firewall.l2tpipsec.masq=1
+	cfg set lp_firewall.l2tpipsec.mtu_fix=1
 fi
-case " $(uci -q get firewall.l2tpipsec.device) " in
+case " $(cfg get lp_firewall.l2tpipsec.device) " in
 	*" $LP_IFACE "*) ;;
-	*) uci add_list firewall.l2tpipsec.device="$LP_IFACE" ;;
+	*) cfg add_list lp_firewall.l2tpipsec.device="$LP_IFACE" ;;
 esac
-case " $(uci -q get firewall.l2tpipsec.network) " in
-	*" l2tpipsec "*) uci del_list firewall.l2tpipsec.network=l2tpipsec ;;
+case " $(cfg get lp_firewall.l2tpipsec.network) " in
+	*" l2tpipsec "*) cfg del_list lp_firewall.l2tpipsec.network=l2tpipsec ;;
 esac
 
-if [ "$(uci -q get firewall.l2tpipsec_lan)" != forwarding ]; then
-	uci set firewall.l2tpipsec_lan=forwarding
-	uci set firewall.l2tpipsec_lan.src=lan
-	uci set firewall.l2tpipsec_lan.dest=l2tpipsec
+if [ "$(cfg get lp_firewall.l2tpipsec_lan)" != forwarding ]; then
+	cfg set lp_firewall.l2tpipsec_lan=forwarding
+	cfg set lp_firewall.l2tpipsec_lan.src=lan
+	cfg set lp_firewall.l2tpipsec_lan.dest=l2tpipsec
 fi
 
 # 仅接受此实例已解密的 L2TP，保护外层 IPsec 不被 WAN NAT 改写。
@@ -63,23 +106,26 @@ set_option firewall.l2tpipsec_snat.position chain-prepend
 set_option firewall.l2tpipsec_snat.chain srcnat
 
 # DNS 模块只向 LAN 和路由器本机提供服务。
-if [ "$(uci -q get firewall.l2tpipsec_dns)" != rule ]; then
-	uci set firewall.l2tpipsec_dns=rule
-	uci set firewall.l2tpipsec_dns.name='Allow-L2TP-IPsec-DNS'
-	uci set firewall.l2tpipsec_dns.src=lan
-	uci set firewall.l2tpipsec_dns.proto='tcp udp'
-	uci set firewall.l2tpipsec_dns.dest_port=1053
-	uci set firewall.l2tpipsec_dns.family=any
-	uci set firewall.l2tpipsec_dns.target=ACCEPT
+if [ "$(cfg get lp_firewall.l2tpipsec_dns)" != rule ]; then
+	cfg set lp_firewall.l2tpipsec_dns=rule
+	cfg set lp_firewall.l2tpipsec_dns.name='Allow-L2TP-IPsec-DNS'
+	cfg set lp_firewall.l2tpipsec_dns.src=lan
+	cfg set lp_firewall.l2tpipsec_dns.proto='tcp udp'
+	cfg set lp_firewall.l2tpipsec_dns.dest_port=1053
+	cfg set lp_firewall.l2tpipsec_dns.family=any
+	cfg set lp_firewall.l2tpipsec_dns.target=ACCEPT
 fi
 
+result=0
+network_changed=0
 firewall_changed=0
-if [ -n "$(uci -q changes firewall)" ]; then
-	uci commit firewall
-	firewall_changed=1
-fi
+publish network
+case $? in 0) network_changed=1 ;; 2) result=1 ;; esac
+publish firewall
+case $? in 0) firewall_changed=1 ;; 2) result=1 ;; esac
 
-[ "$1" = --no-reload ] && exit 0
-[ "$network_changed" = 0 ] || "$LP_INITD/network" reload
-[ "$firewall_changed" = 0 ] || "$LP_INITD/firewall" reload
-exit 0
+if [ "$1" != --no-reload ]; then
+	[ "$network_changed" = 0 ] || "$LP_INITD/network" reload
+	[ "$firewall_changed" = 0 ] || "$LP_INITD/firewall" reload
+fi
+exit "$result"

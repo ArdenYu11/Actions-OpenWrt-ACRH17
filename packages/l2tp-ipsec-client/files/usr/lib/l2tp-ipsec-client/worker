@@ -27,7 +27,8 @@ cleanup_attempt() {
 		;; esac
 	fi
 	lp_stop_pid "${l2tp_pid:-}"
-	[ -S "$LP_DIR/charon.vici" ] && lp_swan --terminate --ike "$LP_CONN" --timeout 2 >/dev/null 2>&1
+	# --timeout 只限制 charon 那一侧；charon 卡住不回复时 swanctl 会一直等，所以再套一层超时
+	[ -S "$LP_DIR/charon.vici" ] && lp_capture 5 /dev/null swanctl --terminate --ike "$LP_CONN" --timeout 2 --uri "$LP_URI"
 	lp_stop_pid "${charon_pid:-}"
 	"$LP_LIB/ppp-hook" down >/dev/null 2>&1
 	if [ "${block_added:-0}" = 1 ]; then
@@ -55,10 +56,9 @@ trap finish TERM INT
 trap 'if lp_owns_session; then rm -f "$LP_DIR/worker.pid" "$LP_DIR/session"; rmdir "$LP_DIR/lock" 2>/dev/null; fi' EXIT
 
 # 路由被系统清掉（例如网卡被重新配置）时原地补回，不断开 VPN，也不需要重新在手机上确认。
+# DNS 进程不重启，已学到的域名地址按记录补回。
 repair_routing() {
-	"$LP_LIB/routing" down
-	rm -f "$LP_DIR/route.error"
-	"$LP_LIB/routing" up
+	"$LP_LIB/routing" repair
 }
 
 attempt() {

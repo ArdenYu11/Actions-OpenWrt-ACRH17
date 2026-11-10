@@ -252,7 +252,7 @@ EOF
 
 lp_has_ipsec() {
 	local output="$LP_DIR/sas.$$" result=1
-	if lp_capture 5 "$output" lp_swan --list-sas; then
+	if lp_capture 5 "$output" swanctl --list-sas --uri "$LP_URI"; then
 		grep -q "${LP_CONN}: #.*ESTABLISHED" "$output" &&
 		grep -q "${LP_CONN}: #.*INSTALLED" "$output" && result=0
 	fi
@@ -260,21 +260,27 @@ lp_has_ipsec() {
 	return "$result"
 }
 
-# 带超时运行命令，输出写入文件。超时后不再等待：卡在内核不可中断状态的进程连 kill -9 都要等，
+# 带超时运行外部命令，输出写入文件。超时后不再等待：卡在内核不可中断状态的进程连 kill -9 都要等，
 # 不能让工作进程跟着卡住。
+# 只能传外部命令，不能传 shell 函数：exec 让后台子进程直接变成该命令，记下的 PID 就是命令本身，
+# 超时能真正结束它。函数里的命令是另一个进程，超时只能结束外层，命令会一直留着。
 lp_capture() {
 	local limit="$1" output="$2" pid ticks=0
 	shift 2
-	"$@" > "$output" 2>/dev/null &
+	( exec "$@" ) > "$output" 2>/dev/null &
 	pid=$!
+	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
+	command_pid=$pid
 	while kill -0 "$pid" 2>/dev/null; do
 		if [ "$ticks" -ge $((limit * 10)) ]; then
 			kill -9 "$pid" 2>/dev/null
+			command_pid=""
 			return 124
 		fi
 		sleep 0.1
 		ticks=$((ticks + 1))
 	done
+	command_pid=""
 	wait "$pid"
 }
 

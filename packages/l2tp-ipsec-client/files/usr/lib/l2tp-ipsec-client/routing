@@ -5,6 +5,49 @@ umask 077
 LP_TABLE=41717
 LP_MARK=41717
 
+# 本插件加的每条规则都记在 routing-rules 里，撤销时按原样逐条删除。
+# 只按优先级批量删会误删其他服务恰好用了同一优先级的规则。
+# 先记再加：加到一半被打断时，记录里也有这条规则。
+add_rule() {
+	printf '%s\n' "$*" >> "$LP_DIR/routing-rules"
+	ip -4 rule add "$@"
+}
+
+delete_rules() {
+	local rule
+	[ -f "$LP_DIR/routing-rules" ] || return 0
+	while IFS= read -r rule; do
+		[ -n "$rule" ] || continue
+		# shellcheck disable=SC2086 # 记录的是按空格分隔的 ip rule 参数
+		ip -4 rule del $rule 2>/dev/null
+	done < "$LP_DIR/routing-rules"
+}
+
+# 网段、VPN DNS 和已学到的域名地址的路由。replace 可重复执行，原地恢复时也用它补回。
+install_routes() {
+	local mode route dns
+	read -r mode < "$LP_DIR/routing-mode"
+	if [ "$mode" = full ]; then
+		ip -4 route replace default dev "$LP_IFACE" table "$LP_TABLE" proto static || return 1
+	else
+		while IFS= read -r route; do
+			[ -n "$route" ] || continue
+			ip -4 route replace "$route" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41717 || return 1
+		done < "$LP_DIR/routes"
+	fi
+	if [ -f "$LP_DIR/active-dns" ]; then
+		read -r dns < "$LP_DIR/active-dns"
+		ip -4 route replace "$dns/32" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41716 || return 1
+	fi
+	# 与 domain-dns 安装时的参数一致
+	if [ -f "$LP_DIR/learned-routes" ]; then
+		while IFS= read -r route; do
+			[ -n "$route" ] || continue
+			ip -4 route replace "$route" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41718 || return 1
+		done < "$LP_DIR/learned-routes"
+	fi
+}
+
 routing_down() {
 	if [ -f "$LP_DIR/dns.pid" ]; then
 		read -r dns_pid < "$LP_DIR/dns.pid"
@@ -14,22 +57,18 @@ routing_down() {
 	fi
 	[ ! -f "$LP_DIR/dns-owned" ] || nft delete table inet l2tpipsec_dns 2>/dev/null
 	if [ -f "$LP_DIR/routing-owned" ]; then
-		for priority in 10100 10101 10102 10103 10104; do
-			while ip -4 rule del priority "$priority" 2>/dev/null; do :; done
-		done
+		delete_rules
 		ip -4 route flush table "$LP_TABLE" 2>/dev/null
 	fi
-	rm -f "$LP_DIR/dns.pid" "$LP_DIR/dns.ready" "$LP_DIR/routing-owned" "$LP_DIR/active-dns" "$LP_DIR/dns-owned"
+	rm -f "$LP_DIR/dns.pid" "$LP_DIR/dns.ready" "$LP_DIR/routing-owned" "$LP_DIR/routing-rules" \
+		"$LP_DIR/active-dns" "$LP_DIR/dns-owned" "$LP_DIR/learned-routes"
 }
 
-# 连接前清理：不看归属标记，直接删掉本插件专用的规则优先级、路由表和 nft 表。
-# 上次异常退出时标记文件可能已经丢了，但这些编号和表名只有本插件使用。
+# 连接前清理上次异常退出的残留。归属标记和规则记录都在运行目录里，工作进程异常退出后仍在，
+# routing_down 会按记录清理。没有记录的规则和表 41717 里的路由无法确认属于本插件，保留不动，
+# 之后 routing up 会因占用拒绝启动，不覆盖其他服务的配置。nft 表名只有本插件使用，直接删除。
 routing_purge() {
 	routing_down
-	for priority in 10100 10101 10102 10103 10104; do
-		while ip -4 rule del priority "$priority" 2>/dev/null; do :; done
-	done
-	ip -4 route flush table "$LP_TABLE" 2>/dev/null
 	nft delete table inet l2tpipsec_dns 2>/dev/null
 	return 0
 }
@@ -52,7 +91,33 @@ routing_check() {
 		read -r dns < "$LP_DIR/active-dns"
 		[ -n "$(ip -4 route show table "$LP_TABLE" exact "$dns/32")" ] || return 1
 	fi
+	# 已学到的域名地址也要在：客户端靠 DNS 缓存或已有连接访问时，路由丢了会落回 WAN。
+	# 地址可能有上千个，一次列出整张表再比对，不逐个调用 ip。
+	if [ -s "$LP_DIR/learned-routes" ]; then
+		ip -4 route show table "$LP_TABLE" | awk '
+			NR == FNR { if ($1 != "") want[$1] = 1; next }
+			{ sub("/32$", "", $1); delete want[$1] }
+			END { for (address in want) exit 1 }' "$LP_DIR/learned-routes" - || return 1
+	fi
 	return 0
+}
+
+# 连接期间原地补回被系统清掉的规则和路由。DNS 进程不重启，已学到的域名地址按记录重新安装。
+routing_repair() {
+	local rule
+	[ -f "$LP_DIR/routing-owned" ] || return 1
+	# 先按记录删掉再加回，还在的规则不会重复
+	delete_rules
+	while IFS= read -r rule; do
+		[ -n "$rule" ] || continue
+		# shellcheck disable=SC2086 # 记录的是按空格分隔的 ip rule 参数
+		ip -4 rule add $rule || return 1
+	done < "$LP_DIR/routing-rules"
+	install_routes || return 1
+	if [ -f "$LP_DIR/dns-owned" ] && ! nft list table inet l2tpipsec_dns >/dev/null 2>&1; then
+		nft -f "$LP_DIR/dns.nft" || return 1
+	fi
+	routing_check
 }
 
 routing_up() {
@@ -60,53 +125,53 @@ routing_up() {
 	read -r mode < "$LP_DIR/routing-mode"
 	read -r dns < "$LP_DIR/configured-dns"
 	read -r server_ip < "$LP_DIR/server-ip"
-	# 独占表和优先级，发现其他路由管理器占用时不覆盖。
-	[ -z "$(ip -4 route show table "$LP_TABLE" 2>/dev/null)" ] || return 1
-	ip -4 rule show | awk '$1 ~ /^1010[0-4]:$/ {found=1} END {exit !found}' && return 1
+	# 独占表和优先级，发现其他服务占用时不覆盖。
+	if [ -n "$(ip -4 route show table "$LP_TABLE" 2>/dev/null)" ] ||
+		ip -4 rule show | awk '$1 ~ /^1010[0-4]:$/ {found=1} END {exit !found}'; then
+		printf '%s\n' "路由表 $LP_TABLE 或规则优先级 10100–10104 已被其他服务占用，未覆盖。请用 ip rule 和 ip route show table $LP_TABLE 查看。" > "$LP_DIR/route.error"
+		return 1
+	fi
+	# 先建记录再写归属标记：有标记就一定有记录
+	: > "$LP_DIR/routing-rules"
 	: > "$LP_DIR/routing-owned"
-	ip -4 rule add priority 10100 to "$server_ip/32" lookup main || return 1
-	ip -4 rule add priority 10102 fwmark "$LP_MARK" lookup main || return 1
+	add_rule priority 10100 to "$server_ip/32" lookup main || return 1
+	add_rule priority 10102 fwmark "$LP_MARK" lookup main || return 1
 	# 全流量保留已有明确出口；规则模式保留直连网段。
 	if [ "$mode" = full ]; then
-		ip -4 rule add priority 10103 lookup main suppress_prefixlength 0 || return 1
+		add_rule priority 10103 lookup main suppress_prefixlength 0 || return 1
 	else
 		ip -4 route show table main scope link | awk '{print $1}' > "$LP_DIR/direct-routes"
 		while IFS= read -r route; do
 			[ -n "$route" ] || continue
-			ip -4 rule add priority 10103 to "$route" lookup main || return 1
+			add_rule priority 10103 to "$route" lookup main || return 1
 		done < "$LP_DIR/direct-routes"
 	fi
-	ip -4 rule add priority 10104 lookup "$LP_TABLE" || return 1
-	if [ "$mode" = full ]; then
-		ip -4 route add default dev "$LP_IFACE" table "$LP_TABLE" proto static || return 1
-	else
-		while IFS= read -r route; do
-			[ -n "$route" ] || continue
-			ip -4 route replace "$route" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41717 || return 1
-		done < "$LP_DIR/routes"
-	fi
+	add_rule priority 10104 lookup "$LP_TABLE" || return 1
+	rm -f "$LP_DIR/active-dns" "$LP_DIR/learned-routes"
+	install_routes || return 1
 	# 没有域名规则时，网段分流无需 DNS 模块。
 	[ "$mode" = full ] || [ -s "$LP_DIR/domain-rules" ] || return 0
 	[ -n "$dns" ] || dns=${DNS1:-${DNS2:-}}
-	# 连接期间恢复路由时没有 pppd 传来的环境变量，用 ppp-hook 记下的地址
+	# pppd 没传 DNS 环境变量时，用 ppp-hook 记下的地址
 	[ -n "$dns" ] || [ ! -f "$LP_DIR/peer-dns" ] || read -r dns < "$LP_DIR/peer-dns"
 	lp_ip4 "$dns" && [ "$dns" != "$server_ip" ] && [ "$dns" != 127.0.0.1 ] && [ "$dns" != 0.0.0.0 ] || {
 		printf '%s\n' '远端未下发可用 DNS，请填写 VPN DNS。' > "$LP_DIR/route.error"
 		return 1
 	}
+	printf '%s\n' "$dns" > "$LP_DIR/active-dns"
 	ip -4 route replace "$dns/32" dev "$LP_IFACE" table "$LP_TABLE" proto static metric 41716 || return 1
-	ip -4 rule add priority 10101 to "$dns/32" lookup "$LP_TABLE" || return 1
+	add_rule priority 10101 to "$dns/32" lookup "$LP_TABLE" || return 1
 	devices=""
 	. /lib/functions/network.sh
 	network_get_device device lan
 	case "$device" in ''|*[!a-zA-Z0-9_.:-]*) return 1 ;; esac
 	devices="\"$device\""
-	printf '%s\n' "$dns" > "$LP_DIR/active-dns"
 	nft list table inet l2tpipsec_dns >/dev/null 2>&1 && return 1
 	rm -f "$LP_DIR/dns.ready"
 	: > "$LP_DIR/dns.log"
 	"$LP_LIB/domain-dns" --rules "$LP_DIR/domain-rules" --vpn-dns "$dns" \
 		--local-dns 127.0.0.1 --mode "$mode" --listen :: --mark "$LP_MARK" \
+		--learned "$LP_DIR/learned-routes" \
 		--ready "$LP_DIR/dns.ready" >> "$LP_DIR/dns.log" 2>&1 &
 	dns_pid=$!
 	printf '%s\n' "$dns_pid" > "$LP_DIR/dns.pid"
@@ -154,5 +219,6 @@ up) routing_up ;;
 down) routing_down ;;
 purge) routing_purge ;;
 check) routing_check ;;
+repair) routing_repair ;;
 *) exit 1 ;;
 esac
