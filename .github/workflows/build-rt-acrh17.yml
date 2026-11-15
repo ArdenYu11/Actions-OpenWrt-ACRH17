@@ -125,9 +125,19 @@ jobs:
           done < <(grep -E '^CONFIG_PACKAGE_[^=]+=y$' "$GITHUB_WORKSPACE/$CONFIG_FILE")
 
       - name: Download sources
+        # 单个源码连接挂死时 make download 不会自己退出，这步曾卡满 5 小时。
+        # 里面用 timeout 砍掉，外面再兜一层，失败就快速报错而不是耗光 job 预算。
+        timeout-minutes: 45
         run: |
           cd openwrt
-          make download -j8
+          # 不少源码走 git，git 默认无限等：低速超过 60 秒自己断开，交给上层重试
+          git config --global http.lowSpeedLimit 1000
+          git config --global http.lowSpeedTime 60
+          timeout -k 10 1500 make download -j8 || {
+            echo '并行下载未完成（可能有连接挂住），清掉半截文件后串行补齐'
+            find dl -size -1024c -exec rm -f {} \;
+          }
+          timeout -k 10 1080 make download -j1
           find dl -size -1024c -exec ls -l {} \;
           find dl -size -1024c -exec rm -f {} \;
 
