@@ -260,25 +260,48 @@ lp_has_ipsec() {
 	return "$result"
 }
 
+# charon 的真实失败原因只写在自己的日志里，界面上那句通用提示容易指错方向，
+# 这里取最后一行为错误的信息带进状态。取不到时返回空串。
+lp_ipsec_reason() {
+	[ -f "$LP_DIR/charon.log" ] || return 0
+	tail -n 30 "$LP_DIR/charon.log" 2>/dev/null |
+		grep -iE 'error|fail|no (shared key|proposal|matching)|received (INVALID|AUTHENTICATION)' |
+		tail -n 1 |
+		sed 's/^[0-9]*\[[A-Z]*\][[:space:]]*//' |
+		cut -c1-120
+}
+
 # 带超时运行外部命令，输出写入文件。超时后不再等待：卡在内核不可中断状态的进程连 kill -9 都要等，
 # 不能让工作进程跟着卡住。
 # 只能传外部命令，不能传 shell 函数：exec 让后台子进程直接变成该命令，记下的 PID 就是命令本身，
 # 超时能真正结束它。函数里的命令是另一个进程，超时只能结束外层，命令会一直留着。
+# 计时不能用 sleep 0.1：busybox 默认没编译小数延时（sleep 0.1 直接报错退出），
+# 靠 tick 计数的循环会在几毫秒内跑完，把还在正常输出的命令当成超时杀掉。
+# 有 timeout 就交给它，没有才按整秒轮询。
 lp_capture() {
-	local limit="$1" output="$2" pid ticks=0
+	local limit="$1" output="$2" pid deadline result
 	shift 2
+	if command -v timeout >/dev/null 2>&1; then
+		( exec timeout "$limit" "$@" ) > "$output" 2>/dev/null &
+		pid=$!
+		command_pid=$pid
+		wait "$pid"
+		result=$?
+		command_pid=""
+		return "$result"
+	fi
 	( exec "$@" ) > "$output" 2>/dev/null &
 	pid=$!
 	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
 	command_pid=$pid
+	deadline=$(($(date +%s) + limit))
 	while kill -0 "$pid" 2>/dev/null; do
-		if [ "$ticks" -ge $((limit * 10)) ]; then
+		if [ "$(date +%s)" -ge "$deadline" ]; then
 			kill -9 "$pid" 2>/dev/null
 			command_pid=""
 			return 124
 		fi
-		sleep 0.1
-		ticks=$((ticks + 1))
+		sleep 1
 	done
 	command_pid=""
 	wait "$pid"
@@ -343,10 +366,10 @@ lp_alive() {
 lp_stop_pid() {
 	lp_alive "$1" || return 0
 	kill "$1" 2>/dev/null
-	local tries=0
-	while lp_alive "$1" && [ "$tries" -lt 20 ]; do
-		sleep 0.1
-		tries=$((tries + 1))
+	# 按整秒轮询：busybox 没有 sleep 0.1，否则退让时间会被瞬间吃光，直接跳到强杀
+	local deadline=$(($(date +%s) + 2))
+	while lp_alive "$1" && [ "$(date +%s)" -lt "$deadline" ]; do
+		sleep 1
 	done
 	lp_alive "$1" && kill -9 "$1" 2>/dev/null
 	return 0

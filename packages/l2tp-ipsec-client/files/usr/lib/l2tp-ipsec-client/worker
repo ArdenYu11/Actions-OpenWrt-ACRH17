@@ -110,7 +110,11 @@ attempt() {
 	}
 	lp_state ipsec '正在建立 IPsec 加密连接。'
 	lp_wait_command swanctl --initiate --child "$LP_CONN" --timeout 25 --uri "$LP_URI" >/dev/null 2>&1
-	lp_has_ipsec || { lp_state error 'IPsec 协商失败，请检查 PSK、身份标识和加密算法。'; return 1; }
+	lp_has_ipsec || {
+		reason=$(lp_ipsec_reason)
+		lp_state error "IPsec 协商失败，请检查 PSK、身份标识和加密算法。${reason:+（charon：${reason}）}"
+		return 1
+	}
 	lp_state ppp "IPsec 已建立，正在验证账号并连接 PPP；如需在手机上确认登录，请在 ${LP_PPP_TIMEOUT} 秒内完成。"
 	# xl2tpd-control 的结果管道路径写死在这个目录，目录不在就会直接拨号失败
 	mkdir -p "$LP_XL2TPD_RUN" && chmod 700 "$LP_XL2TPD_RUN"

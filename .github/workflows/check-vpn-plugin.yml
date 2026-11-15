@@ -31,6 +31,7 @@ jobs:
         run: |
           python3 tests/test_backend.py
           python3 tests/test_retry_probe.py
+          python3 tests/test_capture_timeout.py
           node tests/test_ui_rules.js
           python3 tests/test_domain_dns.py
           python3 tests/test_routing.py
