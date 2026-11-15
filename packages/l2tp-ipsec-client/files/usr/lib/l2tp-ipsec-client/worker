@@ -27,8 +27,10 @@ cleanup_attempt() {
 		;; esac
 	fi
 	lp_stop_pid "${l2tp_pid:-}"
-	# --timeout 只限制 charon 那一侧；charon 卡住不回复时 swanctl 会一直等，所以再套一层超时
-	[ -S "$LP_DIR/charon.vici" ] && lp_capture 5 /dev/null swanctl --terminate --ike "$LP_CONN" --timeout 2 --uri "$LP_URI"
+	# --timeout 只限制 charon 那一侧；charon 卡住不回复时 swanctl 会一直等，所以再套一层超时。
+	# 取 3 秒：--timeout 2 已经限制住正常情况，留 1 秒余量即可，
+	# 停止服务时 procd 只等 15 秒，这里不能把预算吃光。
+	[ -S "$LP_DIR/charon.vici" ] && lp_capture 3 /dev/null swanctl --terminate --ike "$LP_CONN" --timeout 2 --uri "$LP_URI"
 	lp_stop_pid "${charon_pid:-}"
 	"$LP_LIB/ppp-hook" down >/dev/null 2>&1
 	if [ "${block_added:-0}" = 1 ]; then

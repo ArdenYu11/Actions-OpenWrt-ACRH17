@@ -11,6 +11,8 @@ LP_URI="unix://$LP_DIR/charon.vici"
 LP_XL2TPD_RUN=${LP_XL2TPD_RUN:-/var/run/xl2tpd}
 # PPP 认证阶段可能要在手机上确认登录，等待时间要留足
 LP_PPP_TIMEOUT=90
+# 超时先发 TERM，宽限这几秒后补 KILL。SIGKILL 不能被忽略，是最后一道保证
+LP_KILL_GRACE=1
 
 lp_load() {
 	. /lib/functions.sh
@@ -271,40 +273,43 @@ lp_ipsec_reason() {
 		cut -c1-120
 }
 
-# 带超时运行外部命令，输出写入文件。超时后不再等待：卡在内核不可中断状态的进程连 kill -9 都要等，
-# 不能让工作进程跟着卡住。
-# 只能传外部命令，不能传 shell 函数：exec 让后台子进程直接变成该命令，记下的 PID 就是命令本身，
-# 超时能真正结束它。函数里的命令是另一个进程，超时只能结束外层，命令会一直留着。
-# 计时不能用 sleep 0.1：busybox 默认没编译小数延时（sleep 0.1 直接报错退出），
-# 靠 tick 计数的循环会在几毫秒内跑完，把还在正常输出的命令当成超时杀掉。
-# 有 timeout 就交给它，没有才按整秒轮询。
+# 带超时运行外部命令，输出写入文件。超时统一返回 124，否则原样返回命令的退出码。
+#
+# 到点必须真的能杀死，所以先 TERM、宽限 LP_KILL_GRACE 秒再补一刀 KILL：
+# finish() 用 trap '' 忽略 TERM，而「忽略」的处置会被子进程继承（被捕获的信号才会在
+# exec 时恢复默认）。只发 TERM 的话，swanctl 这类子进程永远不会退出，等待会一直挂着，
+# 后续凭据、会话、XFRM 策略的清理都执行不到。SIGKILL 不能被忽略，是最后一道保证。
+#
+# 判断命令是否结束只能靠 wait，不能用 kill -0 轮询：busybox ash 不回收后台子进程，
+# 已经退出的命令会一直是僵尸，kill -0 照样成功，轮询会把正常结束的命令当成超时杀掉。
+# wait 在子进程被 KILL 后立刻返回，拿到的是真实退出状态。
+#
+# 计时也不能用 sleep 0.1：busybox 默认没编译小数延时，sleep 0.1 会直接报错退出。
 lp_capture() {
-	local limit="$1" output="$2" pid ticks=0 result
+	local limit="$1" output="$2" pid watchdog result
 	shift 2
-	if command -v timeout >/dev/null 2>&1; then
-		( exec timeout "$limit" "$@" ) > "$output" 2>/dev/null &
-		pid=$!
-		command_pid=$pid
-		wait "$pid"
-		result=$?
-		command_pid=""
-		return "$result"
-	fi
 	( exec "$@" ) > "$output" 2>/dev/null &
 	pid=$!
 	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
 	command_pid=$pid
-	while kill -0 "$pid" 2>/dev/null; do
-		if [ "$ticks" -ge "$limit" ]; then
-			kill -9 "$pid" 2>/dev/null
-			command_pid=""
-			return 124
-		fi
-		sleep 1
-		ticks=$((ticks + 1))
-	done
-	command_pid=""
+	(
+		sleep "$limit"
+		kill -TERM "$pid" 2>/dev/null
+		sleep "$LP_KILL_GRACE"
+		kill -KILL "$pid" 2>/dev/null
+	) >/dev/null 2>&1 &
+	watchdog=$!
 	wait "$pid"
+	result=$?
+	# 命令已经结束，看门狗没用了：立刻结束它，免得它到期后把被复用的 PID 当成目标
+	kill -KILL "$watchdog" 2>/dev/null
+	command_pid=""
+	# 被信号结束就是超时：TERM 是 143、KILL 是 137。统一报 124，
+	# 调用方和测试都不用关心是哪个信号、由谁发的。
+	case "$result" in
+		137|143) return 124 ;;
+	esac
+	return "$result"
 }
 
 # 列出会和本插件抢端口的其他 IPsec/L2TP 进程，格式如「xl2tpd（PID 123）」。
