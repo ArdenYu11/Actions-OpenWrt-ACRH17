@@ -13,6 +13,23 @@
 7. 用 SSH 连上内网机器，保持 15 分钟以上不断开。
 8. 故意填错密码或不在手机上确认，页面给出 PPP 失败的提示，日志里写明自动重连已关闭。
 
+## 超时捕获的收尾：强制终止与测试补强（2026-11-16）
+
+上一版 `lp_capture` 改用 `timeout` 之后留下两个问题，只查不修地复核后一并处理：
+
+**清理阶段可能卡住。** `cleanup_attempt` 里的 `swanctl --terminate` 走 `lp_capture`，而 `finish()` 第一行是 `trap '' TERM INT`。`trap ''` 设的是「忽略」，忽略的处置会跨 fork/exec 被子进程继承（被捕获的才会在 exec 时恢复默认），所以 `timeout` 到点发的那一下 TERM 等于没发；`timeout` 不带 `-k` 时会一直等目标退出，`lp_capture` 的 `wait` 随之挂住，后面的 `lp_stop_pid charon`、`ppp-hook down`、`ip xfrm policy delete`、路由删除全都执行不到。只在停止服务/断开这条路径上触发；procd 约 15 秒后强杀，所以是「清理被中断」而不是永久卡死。
+
+**测试只认 GNU 的返回值。** busybox 的 `timeout` 直接 `exec` 目标程序，由孙进程 `kill(parent, signo)`，源码里没有 124 这个返回值，程序被 TERM 结束后的 `$?` 是 143。测试硬断言 `rc=124`，Ubuntu CI 用 GNU timeout 所以通过，真机上跑必挂，也因此漏掉了上一条。
+
+修复：
+
+- `lp_capture` 不再调用 `timeout`，改为自己起一个看门狗：到期先 `TERM`，宽限 `LP_KILL_GRACE`（1 秒）后补 `KILL`。`SIGKILL` 不能被忽略，是最后一道保证；返回值由自己统一成 124，不再随 GNU/busybox 变化。
+- 判断命令是否结束只用 `wait`，不再用 `kill -0` 轮询。busybox 的 ash 不回收后台子进程（`shell/ash.c` 的 `signal_handler` 对 SIGCHLD 只置 `got_sigchld`，只有 `wait` 才 `dowait`），已退出的命令会一直是僵尸，`kill -0` 照样成功——轮询会把正常结束的命令当成超时，正是 IPsec 被误判的另一种形态。
+- `cleanup_attempt` 里把 `lp_capture 5` 收到 3 秒：内层 `--timeout 2` 已经限制住正常情况，而 procd 停止服务只等 15 秒，这里不能把预算吃光。
+- `tests/test_capture_timeout.py` 补到 7 项：快速命令必须立刻返回且不能报超时、退出码原样透传、普通超时、命令忽略 TERM 仍能被结束、禁止小数 `sleep`、`lp_capture` 内禁止 `kill -0` 轮询和 `timeout` 依赖。
+
+对照验证：用一个「只 `shift` 后 `exec`，什么都不杀」的 `timeout` 桩模拟 busybox 语义，把同一份新测试分别跑在修复前（`4a19da9`）和修复后——修复前「普通超时」「忽略 TERM」两项 25 秒内不返回（卡住），修复后 7 项全过。本机 `test_routing`、`test_domain_dns`、`test_backend`、`test_retry_probe`、`test_ui_rules` 均通过；`test_ensure_config` 的 `test_commit_released_lock_but_not_renamed_is_kept` 在修复前后的代码上都失败，是 macOS 上 uci 锁用例的既有差异，与本次改动无关。
+
 ## 真机故障修复：IPsec 建好却被判失败（2026-11-15）
 
 现象：网页提示「IPsec 协商失败，请检查 PSK、身份标识和加密算法」，但 `charon.log` 里 IKE_SA 和 CHILD_SA 都已 `established`，紧接着 0 字节被本地删除（`sending DELETE`）。
@@ -21,7 +38,7 @@
 
 修复：
 
-- `lp_capture` 优先用 busybox 默认开启的 `timeout`，没有它才按整秒轮询，不再依赖小数延时。
+- `lp_capture` 优先用 busybox 默认开启的 `timeout`，没有它才按整秒轮询，不再依赖小数延时。（这条 `timeout` 的做法在下一轮被替换掉了，见上面「超时捕获的收尾」。）
 - `lp_stop_pid`、`routing` 等 `dns.ready`、`rpcd` 的 `wait_stopped` 三处同样的小数延时，改成按截止时间等整秒。
 - IPsec 失败时把 charon 日志里的最后一条错误带进状态提示，不再只有通用文案。
 - 新增 `tests/test_capture_timeout.py`：用只接受整数、其余直接报错的 `sleep` 桩复现该问题，并禁止脚本里再出现小数 `sleep`。
