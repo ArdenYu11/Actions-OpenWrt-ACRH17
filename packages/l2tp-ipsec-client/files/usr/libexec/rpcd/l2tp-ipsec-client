@@ -21,9 +21,10 @@ running() {
 wait_stopped() {
 	# procd 停止服务时最多等 15 秒才强制结束，这里多等一会儿；
 	# busybox 没有小数延时，按整秒等
-	local deadline=$(($(date +%s) + 16))
-	while running && [ "$(date +%s)" -lt "$deadline" ]; do
+	local tries=0
+	while running && [ "$tries" -lt 16 ]; do
 		sleep 1
+		tries=$((tries + 1))
 	done
 	! running
 }
