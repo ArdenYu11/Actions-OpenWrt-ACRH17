@@ -175,11 +175,12 @@ routing_up() {
 		--ready "$LP_DIR/dns.ready" >> "$LP_DIR/dns.log" 2>&1 &
 	dns_pid=$!
 	printf '%s\n' "$dns_pid" > "$LP_DIR/dns.pid"
-	# dns 进程通常不到 1 秒就绪；busybox 没有小数延时，按整秒等最多 2 秒
-	local deadline=$(($(date +%s) + 2))
-	while [ ! -f "$LP_DIR/dns.ready" ] && [ "$(date +%s)" -lt "$deadline" ]; do
-		lp_alive "$dns_pid" || return 1
+	# dns 进程通常不到 1 秒就绪；busybox 没有小数延时，按整秒最多等 2 秒。
+	# 只看就绪文件：进程可能写完就绪标记就退出，中途查存活会把成功当成失败。
+	local tries=0
+	while [ ! -f "$LP_DIR/dns.ready" ] && [ "$tries" -lt 2 ]; do
 		sleep 1
+		tries=$((tries + 1))
 	done
 	[ -f "$LP_DIR/dns.ready" ] || return 1
 	cat > "$LP_DIR/dns.nft" <<EOF

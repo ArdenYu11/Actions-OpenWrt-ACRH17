@@ -279,7 +279,7 @@ lp_ipsec_reason() {
 # 靠 tick 计数的循环会在几毫秒内跑完，把还在正常输出的命令当成超时杀掉。
 # 有 timeout 就交给它，没有才按整秒轮询。
 lp_capture() {
-	local limit="$1" output="$2" pid deadline result
+	local limit="$1" output="$2" pid ticks=0 result
 	shift 2
 	if command -v timeout >/dev/null 2>&1; then
 		( exec timeout "$limit" "$@" ) > "$output" 2>/dev/null &
@@ -294,14 +294,14 @@ lp_capture() {
 	pid=$!
 	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
 	command_pid=$pid
-	deadline=$(($(date +%s) + limit))
 	while kill -0 "$pid" 2>/dev/null; do
-		if [ "$(date +%s)" -ge "$deadline" ]; then
+		if [ "$ticks" -ge "$limit" ]; then
 			kill -9 "$pid" 2>/dev/null
 			command_pid=""
 			return 124
 		fi
 		sleep 1
+		ticks=$((ticks + 1))
 	done
 	command_pid=""
 	wait "$pid"
@@ -367,9 +367,10 @@ lp_stop_pid() {
 	lp_alive "$1" || return 0
 	kill "$1" 2>/dev/null
 	# 按整秒轮询：busybox 没有 sleep 0.1，否则退让时间会被瞬间吃光，直接跳到强杀
-	local deadline=$(($(date +%s) + 2))
-	while lp_alive "$1" && [ "$(date +%s)" -lt "$deadline" ]; do
+	local tries=0
+	while lp_alive "$1" && [ "$tries" -lt 2 ]; do
 		sleep 1
+		tries=$((tries + 1))
 	done
 	lp_alive "$1" && kill -9 "$1" 2>/dev/null
 	return 0
