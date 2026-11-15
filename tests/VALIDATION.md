@@ -13,6 +13,21 @@
 7. 用 SSH 连上内网机器，保持 15 分钟以上不断开。
 8. 故意填错密码或不在手机上确认，页面给出 PPP 失败的提示，日志里写明自动重连已关闭。
 
+## 真机故障修复：IPsec 建好却被判失败（2026-11-15）
+
+现象：网页提示「IPsec 协商失败，请检查 PSK、身份标识和加密算法」，但 `charon.log` 里 IKE_SA 和 CHILD_SA 都已 `established`，紧接着 0 字节被本地删除（`sending DELETE`）。
+
+原因：`lp_capture` 用 `sleep 0.1` 凑 5 秒预算（50 个 tick）。固件里的 busybox 没有编译小数延时（`CONFIG_FLOAT_DURATION=n`，`usleep` 也没开），每条 `sleep 0.1` 都直接报错退出，循环在几毫秒内跑完 50 次，把还在输出的 `swanctl --list-sas` 当成超时 `kill -9`，返回 124，`lp_has_ipsec` 于是判定 IPsec 没建立，`cleanup_attempt` 随即拆掉刚建好的隧道。这些 `sleep` 报错走 stderr，而 worker 的 stderr 指向 `/dev/null`，路由上看不到。
+
+修复：
+
+- `lp_capture` 优先用 busybox 默认开启的 `timeout`，没有它才按整秒轮询，不再依赖小数延时。
+- `lp_stop_pid`、`routing` 等 `dns.ready`、`rpcd` 的 `wait_stopped` 三处同样的小数延时，改成按截止时间等整秒。
+- IPsec 失败时把 charon 日志里的最后一条错误带进状态提示，不再只有通用文案。
+- 新增 `tests/test_capture_timeout.py`：用只接受整数、其余直接报错的 `sleep` 桩复现该问题，并禁止脚本里再出现小数 `sleep`。
+
+本机复现对比：同一段 `lp_capture 5 ... /bin/sleep 1`，旧版打印 50 条 `sleep: invalid number '0.1'` 后返回 124，新版返回 0。
+
 ## PR 第四轮审核问题修复（2026-11-10）
 
 针对基于 `29362b1` 的两项问题：
