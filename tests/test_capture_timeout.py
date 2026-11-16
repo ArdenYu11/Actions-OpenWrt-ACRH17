@@ -24,6 +24,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PACKAGE = ROOT / 'packages/l2tp-ipsec-client/files'
 COMMON = PACKAGE / 'usr/lib/l2tp-ipsec-client/common.sh'
+WORKER = PACKAGE / 'usr/lib/l2tp-ipsec-client/worker'
 
 SCRIPTS = [
     'usr/lib/l2tp-ipsec-client/common.sh',
@@ -41,6 +42,24 @@ def function_body(name):
     start = text.index(f'\n{name}() {{')
     end = text.index('\n}\n', start)
     return text[start:end]
+
+
+def worker_function(name):
+    """取 worker 里某个函数的源码，测试直接跑真实实现，避免和副本走偏。"""
+    text = WORKER.read_text()
+    start = text.index(f'\n{name}() {{')
+    end = text.index('\n}\n', start) + 2
+    return text[start + 1:end]
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 class CaptureTests(unittest.TestCase):
@@ -76,13 +95,12 @@ class CaptureTests(unittest.TestCase):
         result = self.shell(
             'lp_capture 3 "$OUT" printf \'l2tpipsec: #1, ESTABLISHED, IKEv1\\n'
             'l2tpipsec: #1, reqid 41717, INSTALLED, TRANSPORT\\n\'\n'
-            'rc=$?\n'
-            'printf \'rc=%s\\n\' "$rc"\n'
-            'cat "$OUT"', )
+            'printf \'rc=%s\\n\' "$?"')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('rc=0', result.stdout, result.stderr)
-        self.assertIn('ESTABLISHED', result.stdout)
-        self.assertIn('INSTALLED', result.stdout)
+        captured = self.output.read_text()
+        self.assertIn('ESTABLISHED', captured)
+        self.assertIn('INSTALLED', captured)
 
     def test_fast_command_is_not_reported_as_timeout(self):
         # 命令很快结束，就必须立刻拿到退出码。靠 kill -0 轮询的实现会一直看到
@@ -118,6 +136,71 @@ class CaptureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('rc=124', result.stdout, result.stderr)
         self.assertLess(elapsed, 6, '忽略 TERM 的命令没有被强制结束')
+
+    def test_stop_kills_pending_watchdog(self):
+        # 停止服务时 finish() 直接 exit，跳过 lp_capture 后面的回收。这里用 worker 里
+        # 真实的 cleanup_attempt 收尾，看门狗必须一起结束，否则它到期会向旧 PID 发信号。
+        run_dir = self.directory / 'run'
+        run_dir.mkdir()
+        script = (
+            f'LP_DIR={shlex.quote(str(run_dir))}\n'
+            'mkdir -p "$LP_DIR"\n'
+            'printf \'%s\\n\' "$$" > "$LP_DIR/session"\n'
+            f'{worker_function("cleanup_attempt")}\n'
+            'finish() {\n'
+            "\ttrap '' TERM INT\n"
+            '\tprintf \'%s\\n\' "${command_watchdog:-none}" > "$LP_DIR/wd.pid"\n'
+            '\tcleanup_attempt\n'
+            '\texit 0\n'
+            '}\n'
+            'trap finish TERM INT\n'
+            '( sleep 1; kill -TERM $$ ) &\n'
+            'lp_capture 30 "$LP_DIR/captured" sleep 30\n'
+        )
+        result = self.shell(script)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        recorded = (run_dir / 'wd.pid').read_text().strip()
+        self.assertRegex(recorded, r'^\d+$', '停止时没有记录看门狗，说明它没被纳入清理')
+        watchdog = int(recorded)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and alive(watchdog):
+            time.sleep(0.05)
+        self.assertFalse(alive(watchdog), '停止后看门狗仍在运行')
+
+    def test_worker_cleanup_stops_watchdog(self):
+        body = worker_function('cleanup_attempt')
+        self.assertIn('command_watchdog', body, 'cleanup_attempt 没有结束 lp_capture 的看门狗')
+
+    def test_same_proc_decision_without_procfs(self):
+        # 比对逻辑用假的启动时间来源验证，不依赖 /proc：
+        # 值变了是别的进程，读不到是进程已经没了，都不该动手；
+        # 一开始就取不到（没有 /proc）时按「还是它」处理，保证超时仍然生效。
+        result = self.shell(
+            'lp_proc_start() { printf \'%s\' "$FAKE"; }\n'
+            'FAKE=100; lp_same_proc 1 200; printf \'changed=%s\\n\' "$?"\n'
+            'FAKE=300; lp_same_proc 1 300; printf \'same=%s\\n\' "$?"\n'
+            'FAKE=; lp_same_proc 1 300; printf \'gone=%s\\n\' "$?"\n'
+            'FAKE=300; lp_same_proc 1 ""; printf \'noprocfs=%s\\n\' "$?"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('changed=1', result.stdout, result.stderr)
+        self.assertIn('same=0', result.stdout, result.stderr)
+        self.assertIn('gone=1', result.stdout, result.stderr)
+        self.assertIn('noprocfs=0', result.stdout, result.stderr)
+
+    @unittest.skipUnless(os.path.isdir('/proc'), '需要 /proc 才能比对进程启动时间')
+    def test_same_proc_rejects_finished_process(self):
+        # 看门狗到期前用它确认还行是不是当初那个进程：被 KILL 掉、或 PID 被复用时不能动手。
+        result = self.shell(
+            'sleep 5 & p=$!\n'
+            'start=$(lp_proc_start "$p")\n'
+            'printf \'start=%s\\n\' "${start:+ok}"\n'
+            'lp_same_proc "$p" "$start"; printf \'live=%s\\n\' "$?"\n'
+            'kill -KILL "$p"; wait "$p" 2>/dev/null\n'
+            'lp_same_proc "$p" "$start"; printf \'gone=%s\\n\' "$?"\n')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('start=ok', result.stdout, result.stderr)
+        self.assertIn('live=0', result.stdout, result.stderr)
+        self.assertIn('gone=1', result.stdout, result.stderr)
 
     def test_scripts_do_not_use_fractional_sleep(self):
         pattern = re.compile(r'\bsleep\s+[0-9]+\.[0-9]+')

@@ -13,6 +13,23 @@
 7. 用 SSH 连上内网机器，保持 15 分钟以上不断开。
 8. 故意填错密码或不在手机上确认，页面给出 PPP 失败的提示，日志里写明自动重连已关闭。
 
+## 停止服务时看门狗的回收（2026-11-16）
+
+上一版给 `lp_capture` 加了看门狗（到期 TERM 再补 KILL），但看门狗只是函数里的局部变量，停止服务时没有被谁管：
+
+- 查询期间收到停止信号，`finish()` 会 `exit 0`，直接跳过 `lp_capture` 里 `wait` 之后的回收；
+- `cleanup_attempt` 只结束 `command_pid`，不认识看门狗。
+
+于是工作进程退出后，旧看门狗仍然活着，到期（3 或 5 秒）照旧向 `$pid` 发 TERM/KILL。`$pid` 那时已经被回收，PID 若被复用就会误伤别的进程。
+
+修复：
+
+- 看门狗记进全局 `command_watchdog`（和 `command_pid` 一个套路），`cleanup_attempt` 一开始就用 `KILL` 结束它。它剩下的 `sleep` 子进程没有任何后续动作，到期自己退出，不用管。
+- 加 `lp_proc_start` / `lp_same_proc`：看门狗到点前先比对 `/proc/PID/stat` 的启动时间。进程已经没了、或者 PID 被复用（启动时间不同），就什么都不做。这一层是给「工作进程被 `kill -9`、清理根本没机会跑」准备的，那种情况谁也来不及回收。取不到启动时间（没有 `/proc`）时按「还是它」处理，保证超时本身仍然生效。
+- 测试补到 11 项：`test_stop_kills_pending_watchdog` 直接抽取 worker 里**真实的** `cleanup_attempt` 跑停止流程（避免测试里养一份副本走偏），断言停止后看门狗已不在；另有 `lp_same_proc` 的比对逻辑测试（不依赖 `/proc`）和 Linux 上的真实解析测试。
+
+对照验证：`test_stop_kills_pending_watchdog` 在上一版 `9425d9f` 上失败（`command_watchdog=none`，说明看门狗没被记录），修复后通过。`test_backend`、`test_retry_probe`、`test_domain_dns`、`test_routing`、`test_capture_timeout`、`test_ui_rules` 全过，`sh -n` 与 shellcheck（`-s dash -S warning`）无告警。
+
 ## 超时捕获的收尾：强制终止与测试补强（2026-11-16）
 
 上一版 `lp_capture` 改用 `timeout` 之后留下两个问题，只查不修地复核后一并处理：
