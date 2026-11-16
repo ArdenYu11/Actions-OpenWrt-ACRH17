@@ -10,6 +10,13 @@ printf '%s\n' "$$" > "$LP_DIR/session"
 
 cleanup_attempt() {
 	lp_stop_pid "${command_pid:-}"
+	# 查询途中的看门狗也要结束：停止服务时 finish() 直接 exit，不会走到 lp_capture 里的回收，
+	# 留下的看门狗到期会向旧 PID 发 TERM/KILL。它剩下的 sleep 子进程没有任何后续动作，
+	# 到期自己退出，不用管。
+	if [ -n "${command_watchdog:-}" ]; then
+		kill -KILL "$command_watchdog" 2>/dev/null
+		command_watchdog=""
+	fi
 	# 已被新连接接管时，只结束自己启动的进程，不碰新连接的路由和运行文件。
 	if ! lp_owns_session; then
 		lp_stop_pid "${l2tp_pid:-}"

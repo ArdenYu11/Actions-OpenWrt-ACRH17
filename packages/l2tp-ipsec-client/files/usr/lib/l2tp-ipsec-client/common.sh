@@ -273,6 +273,22 @@ lp_ipsec_reason() {
 		cut -c1-120
 }
 
+# 读取进程的启动时间（/proc/PID/stat 第 22 列），同一 PID 被复用时会变。
+# 没有 /proc 的环境返回空串，调用方按「判断不了」处理。
+lp_proc_start() {
+	[ -r "/proc/$1/stat" ] || return 0
+	sed 's/^[^)]*) //' "/proc/$1/stat" 2>/dev/null | cut -d' ' -f20
+}
+
+# 到点确认目标还是当初那个进程：已经结束、或 PID 已被复用，都返回 1。
+# 取不到启动时间时不敢拦，按「还是它」处理，保证超时本身仍然生效。
+lp_same_proc() {
+	local now
+	[ -n "$2" ] || return 0
+	now=$(lp_proc_start "$1")
+	[ -n "$now" ] && [ "$now" = "$2" ]
+}
+
 # 带超时运行外部命令，输出写入文件。超时统一返回 124，否则原样返回命令的退出码。
 #
 # 到点必须真的能杀死，所以先 TERM、宽限 LP_KILL_GRACE 秒再补一刀 KILL：
@@ -284,25 +300,33 @@ lp_ipsec_reason() {
 # 已经退出的命令会一直是僵尸，kill -0 照样成功，轮询会把正常结束的命令当成超时杀掉。
 # wait 在子进程被 KILL 后立刻返回，拿到的是真实退出状态。
 #
+# 看门狗记在 command_watchdog 里：停止服务时 finish() 会直接 exit，跳过下面的回收，
+# 所以 cleanup_attempt 要负责结束它；万一是被 KILL 掉的、清理没机会跑，看门狗会先比对
+# 启动时间，发现 PID 已经不是当初那个进程就什么都不做。
+#
 # 计时也不能用 sleep 0.1：busybox 默认没编译小数延时，sleep 0.1 会直接报错退出。
 lp_capture() {
-	local limit="$1" output="$2" pid watchdog result
+	local limit="$1" output="$2" pid start result
 	shift 2
 	( exec "$@" ) > "$output" 2>/dev/null &
 	pid=$!
 	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
 	command_pid=$pid
+	start=$(lp_proc_start "$pid")
 	(
 		sleep "$limit"
+		lp_same_proc "$pid" "$start" || exit 0
 		kill -TERM "$pid" 2>/dev/null
 		sleep "$LP_KILL_GRACE"
+		lp_same_proc "$pid" "$start" || exit 0
 		kill -KILL "$pid" 2>/dev/null
 	) >/dev/null 2>&1 &
-	watchdog=$!
+	command_watchdog=$!
 	wait "$pid"
 	result=$?
 	# 命令已经结束，看门狗没用了：立刻结束它，免得它到期后把被复用的 PID 当成目标
-	kill -KILL "$watchdog" 2>/dev/null
+	kill -KILL "$command_watchdog" 2>/dev/null
+	command_watchdog=""
 	command_pid=""
 	# 被信号结束就是超时：TERM 是 143、KILL 是 137。统一报 124，
 	# 调用方和测试都不用关心是哪个信号、由谁发的。
