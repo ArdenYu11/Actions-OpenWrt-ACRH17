@@ -14,7 +14,7 @@ LP_PPP_TIMEOUT=90
 # 超时先发 TERM，宽限这几秒后补 KILL。SIGKILL 不能被忽略，是最后一道保证
 LP_KILL_GRACE=1
 # 停止服务时 procd 只等 15 秒就强杀，清理必须在这之前跑完：撤销 xfrm 策略、删路由
-# 是最后几步，被截断就会留下残渣。这里给清理里的所有等待一个总预算，由 cleanup_attempt 重置。
+# 是最后几步，被截断就会留下残渣。这里给清理里的所有等待一个总预算，由 lp_cleanup_begin 启用。
 LP_CLEANUP_BUDGET=10
 # 清理的截止时刻（lp_now 的整秒），空表示不在清理流程里，按各自上限等。
 # 用绝对时刻而不是「还剩几秒」：ppp-hook 和 routing 会在各自的新进程里重新加载这个文件，
