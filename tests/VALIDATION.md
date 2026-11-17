@@ -13,6 +13,26 @@
 7. 用 SSH 连上内网机器，保持 15 分钟以上不断开。
 8. 故意填错密码或不在手机上确认，页面给出 PPP 失败的提示，日志里写明自动重连已关闭。
 
+## 1.3.5 真机验证（2026-11-18）
+
+刷 `RT-ACRH17-20261118-0130`（manifest 里 `l2tp-ipsec-client` / `luci-app-l2tp-ipsec-client` 均 1.3.5-1），
+连跑两轮「连接 → 停止」，两轮数据一致：
+
+- 停止耗时 **4 秒**（用 `ubus call l2tp-ipsec-client stop` 计时，它要等 worker 真的退出才返回；
+  `/etc/init.d/... stop` 只代表 procd 受理）。构成符合预期：pppd / xl2tpd / charon 各 1 整秒
+  （busybox 没有小数延时）+ `swanctl --terminate` + 停 DNS。比 1.3.4 的 6 秒少，离 procd 的 15 秒还有 11 秒余量。
+- 残渣全清：`ip xfrm policy` / `ip xfrm state`（1701、41717）、`ip -4 rule`（10100–10104）、
+  `ip -4 route show table 41717`、`nft list tables | grep l2tpipsec` 均无输出；运行目录只剩日志和
+  渲染出来的配置，`worker.pid` / `session` / `lock` 都已移除；`events.log` 末条是「连接已断开。」。
+- `charon.log` 末尾是正常的 CHILD_SA、IKE_SA DELETE，带收发字节（28371/22512、4218/2312），
+  不是 1.3.2 那种 0 字节被自己拆掉。
+- 第二轮（停止后立刻重连）13 秒内建立，`stop` 仍是 4 秒、残渣仍为空 —— 说明 `lp_cleanup_end`
+  确实清掉了截止时刻，下一次连接没有被过期预算误杀（这是本次改动最需要盯的回归点）。
+
+一个预期内的瞬态：停止后立刻看 `ps` 还能看到 `sleep 3`，那是 `lp_capture` 的看门狗被 KILL 后留下的
+孤儿 sleep，最多 3 秒自行退出，不会再发任何信号。查残留要等 stop 返回 5 秒后再看。
+（用 `grep '[w]orker'` 会把内核线程 `[kworker/...]` 一起列出来，别当成残留。）
+
 ## 清理预算要覆盖宽限和子进程里的 DNS 停止（2026-11-17，v1.3.5）
 
 上一版给清理加了 `LP_CLEANUP_LEFT`（还剩几秒），但它是普通的 shell 变量、靠每步 sleep 自己扣：
