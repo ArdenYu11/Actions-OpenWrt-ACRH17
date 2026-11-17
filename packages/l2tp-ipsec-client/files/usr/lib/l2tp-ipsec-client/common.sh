@@ -13,6 +13,11 @@ LP_XL2TPD_RUN=${LP_XL2TPD_RUN:-/var/run/xl2tpd}
 LP_PPP_TIMEOUT=90
 # 超时先发 TERM，宽限这几秒后补 KILL。SIGKILL 不能被忽略，是最后一道保证
 LP_KILL_GRACE=1
+# 停止服务时 procd 只等 15 秒就强杀，清理必须在这之前跑完：撤销 xfrm 策略、删路由
+# 是最后几步，被截断就会留下残渣。这里给清理里的所有等待一个总预算，由 cleanup_attempt 重置。
+LP_CLEANUP_BUDGET=10
+# 空表示不在清理流程里，不启用总预算（别的场景按单个进程的上限等）
+LP_CLEANUP_LEFT=""
 
 lp_load() {
 	. /lib/functions.sh
@@ -388,20 +393,46 @@ lp_cleanup_leftovers() {
 	return 0
 }
 
+lp_proc_state() {
+	# /proc/PID/stat 的第三个字段是进程状态。进程名里可能有空格和括号，
+	# 所以从最后一个 ") " 之后取，避免被 "(worker)" 这类名字带偏。
+	local stat
+	[ -r "/proc/$1/stat" ] || return 0
+	read -r stat < "/proc/$1/stat" 2>/dev/null || return 0
+	stat=${stat##*) }
+	printf '%s' "${stat%% *}"
+}
+
 lp_alive() {
-	[ -n "$1" ] && kill -0 "$1" 2>/dev/null
+	local state
+	[ -n "$1" ] || return 1
+	kill -0 "$1" 2>/dev/null || return 1
+	# busybox ash 不回收后台子进程：已经退出的会一直是僵尸，kill -0 照样成功。
+	# 不把僵尸算作结束的话，每停一个进程都要白等满上限，断开一次要拖到 procd 的
+	# 15 秒上限，撤销 xfrm 和路由那几步就来不及跑了。
+	# 没有 /proc 时取不到状态，按「还活着」处理，保持原来的语义。
+	state=$(lp_proc_state "$1")
+	[ "$state" != Z ]
 }
 
 lp_stop_pid() {
-	lp_alive "$1" || return 0
-	kill "$1" 2>/dev/null
+	local pid="$1" limit=2 tries=0
+	[ -n "$pid" ] || return 0
+	lp_alive "$pid" || return 0
+	kill "$pid" 2>/dev/null
 	# 按整秒轮询：busybox 没有 sleep 0.1，否则退让时间会被瞬间吃光，直接跳到强杀
-	local tries=0
-	while lp_alive "$1" && [ "$tries" -lt 2 ]; do
+	# 停止服务的总预算不够就少等：后面的撤销动作比让进程体面退出更重要
+	if [ -n "$LP_CLEANUP_LEFT" ] && [ "$limit" -gt "$LP_CLEANUP_LEFT" ]; then
+		limit="$LP_CLEANUP_LEFT"
+	fi
+	while lp_alive "$pid" && [ "$tries" -lt "$limit" ]; do
 		sleep 1
 		tries=$((tries + 1))
+		if [ -n "$LP_CLEANUP_LEFT" ]; then
+			LP_CLEANUP_LEFT=$((LP_CLEANUP_LEFT - 1))
+		fi
 	done
-	lp_alive "$1" && kill -9 "$1" 2>/dev/null
+	lp_alive "$pid" && kill -9 "$pid" 2>/dev/null
 	return 0
 }
 
