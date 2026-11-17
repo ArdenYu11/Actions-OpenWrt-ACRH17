@@ -16,8 +16,11 @@ LP_KILL_GRACE=1
 # 停止服务时 procd 只等 15 秒就强杀，清理必须在这之前跑完：撤销 xfrm 策略、删路由
 # 是最后几步，被截断就会留下残渣。这里给清理里的所有等待一个总预算，由 cleanup_attempt 重置。
 LP_CLEANUP_BUDGET=10
-# 空表示不在清理流程里，不启用总预算（别的场景按单个进程的上限等）
-LP_CLEANUP_LEFT=""
+# 清理的截止时刻（lp_now 的整秒），空表示不在清理流程里，按各自上限等。
+# 用绝对时刻而不是「还剩几秒」：ppp-hook 和 routing 会在各自的新进程里重新加载这个文件，
+# 只传「还剩几秒」会被重置成一份新预算，停 DNS 那一段就跑到总预算之外了。
+# 带 :- 是为了保留父进程 export 出来的值。
+LP_CLEANUP_DEADLINE=${LP_CLEANUP_DEADLINE:-}
 
 lp_load() {
 	. /lib/functions.sh
@@ -294,6 +297,52 @@ lp_same_proc() {
 	[ -n "$now" ] && [ "$now" = "$2" ]
 }
 
+# 当前时间（整秒）。优先读 /proc/uptime：单调、不会因为对时而跳动，也不用 fork。
+# 没有 /proc 的环境退回 date；同一台机器上所有进程走同一分支，截止时刻可以直接比较。
+lp_now() {
+	local uptime
+	if [ -r /proc/uptime ]; then
+		read -r uptime _ < /proc/uptime 2>/dev/null
+		case "$uptime" in
+			''|*[!0-9.]*) ;;
+			*) printf '%s' "${uptime%%.*}"; return 0 ;;
+		esac
+	fi
+	date +%s
+}
+
+# 清理还剩多少秒，放在 LP_BUDGET_LEFT 里。不在清理流程中时返回 1，
+# 调用方按各自的上限等待（连接阶段不受停止预算影响）。
+# 取不到时间时也返回 1：宁可退回各自的上限，也不要在 $(( )) 里报错把清理带崩。
+lp_budget_left() {
+	local now
+	case "${LP_CLEANUP_DEADLINE:-}" in ''|*[!0-9]*) return 1 ;; esac
+	now=$(lp_now)
+	case "$now" in ''|*[!0-9]*) return 1 ;; esac
+	LP_BUDGET_LEFT=$((LP_CLEANUP_DEADLINE - now))
+	[ "$LP_BUDGET_LEFT" -ge 0 ] || LP_BUDGET_LEFT=0
+	return 0
+}
+
+# 整段清理共用一个截止时刻，并且 export 出去：ppp-hook、routing 是子进程，
+# 重新加载 common.sh 时拿到的是同一个截止时刻，而不是从头再给一份预算。
+lp_cleanup_begin() {
+	local now
+	# 先清掉上一轮的截止时刻：取不到时间时退回各自的上限，而不是沿用旧值
+	LP_CLEANUP_DEADLINE=""
+	export LP_CLEANUP_DEADLINE
+	now=$(lp_now)
+	case "$now" in ''|*[!0-9]*) return 0 ;; esac
+	LP_CLEANUP_DEADLINE=$((now + LP_CLEANUP_BUDGET))
+	export LP_CLEANUP_DEADLINE
+}
+
+# 清理结束（含重连循环里的那次）要清掉，否则后面的连接阶段会被过期的预算卡死。
+lp_cleanup_end() {
+	LP_CLEANUP_DEADLINE=""
+	export LP_CLEANUP_DEADLINE
+}
+
 # 带超时运行外部命令，输出写入文件。超时统一返回 124，否则原样返回命令的退出码。
 #
 # 到点必须真的能杀死，所以先 TERM、宽限 LP_KILL_GRACE 秒再补一刀 KILL：
@@ -310,9 +359,20 @@ lp_same_proc() {
 # 启动时间，发现 PID 已经不是当初那个进程就什么都不做。
 #
 # 计时也不能用 sleep 0.1：busybox 默认没编译小数延时，sleep 0.1 会直接报错退出。
+#
+# 清理流程里还有一层约束：等待必须落在 lp_cleanup_begin 给出的截止时刻之前。
+# TERM 之后的宽限也算进去，否则每次超时都多花 LP_KILL_GRACE 秒，几段叠起来就会
+# 把撤销 xfrm 策略、删路由挤到 procd 的 15 秒之外。
 lp_capture() {
-	local limit="$1" output="$2" pid start result
+	local limit="$1" output="$2" pid start result grace="$LP_KILL_GRACE" left
 	shift 2
+	if lp_budget_left; then
+		left=$LP_BUDGET_LEFT
+		[ "$grace" -le "$left" ] || grace=$left
+		left=$((left - grace))
+		[ "$limit" -le "$left" ] || limit=$left
+		[ "$limit" -ge 0 ] || limit=0
+	fi
 	( exec "$@" ) > "$output" 2>/dev/null &
 	pid=$!
 	# 工作进程这时收到停止信号，cleanup_attempt 会结束 command_pid
@@ -322,7 +382,7 @@ lp_capture() {
 		sleep "$limit"
 		lp_same_proc "$pid" "$start" || exit 0
 		kill -TERM "$pid" 2>/dev/null
-		sleep "$LP_KILL_GRACE"
+		if [ "$grace" -gt 0 ]; then sleep "$grace"; fi
 		lp_same_proc "$pid" "$start" || exit 0
 		kill -KILL "$pid" 2>/dev/null
 	) >/dev/null 2>&1 &
@@ -421,16 +481,14 @@ lp_stop_pid() {
 	lp_alive "$pid" || return 0
 	kill "$pid" 2>/dev/null
 	# 按整秒轮询：busybox 没有 sleep 0.1，否则退让时间会被瞬间吃光，直接跳到强杀
-	# 停止服务的总预算不够就少等：后面的撤销动作比让进程体面退出更重要
-	if [ -n "$LP_CLEANUP_LEFT" ] && [ "$limit" -gt "$LP_CLEANUP_LEFT" ]; then
-		limit="$LP_CLEANUP_LEFT"
+	# 停止服务的总预算不够就少等：后面的撤销动作比让进程体面退出更重要。
+	# 截止时刻已过（剩 0 秒）时不再等，直接强杀。
+	if lp_budget_left && [ "$limit" -gt "$LP_BUDGET_LEFT" ]; then
+		limit="$LP_BUDGET_LEFT"
 	fi
 	while lp_alive "$pid" && [ "$tries" -lt "$limit" ]; do
 		sleep 1
 		tries=$((tries + 1))
-		if [ -n "$LP_CLEANUP_LEFT" ]; then
-			LP_CLEANUP_LEFT=$((LP_CLEANUP_LEFT - 1))
-		fi
 	done
 	lp_alive "$pid" && kill -9 "$pid" 2>/dev/null
 	return 0

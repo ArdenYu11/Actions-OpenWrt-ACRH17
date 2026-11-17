@@ -9,9 +9,11 @@ printf '%s\n' "$$" > "$LP_DIR/worker.pid"
 printf '%s\n' "$$" > "$LP_DIR/session"
 
 cleanup_attempt() {
-	# 清理里的每一步等待都从这里扣时间：procd 只等 15 秒就强杀，而撤销 xfrm 策略、
-	# 删路由是最后几步，被截断就会留下残渣。预算用完就跳过等待直接 SIGKILL。
-	LP_CLEANUP_LEFT=$LP_CLEANUP_BUDGET
+	# 清理里的每一步等待都从同一个截止时刻往后算：procd 只等 15 秒就强杀，而撤销
+	# xfrm 策略、删路由是最后几步，被截断就会留下残渣。截止时刻是绝对时间并 export
+	# 出去，ppp-hook、routing 在各自进程里重新加载 common.sh 时不会重新开始计时，
+	# 停 DNS 那一段也受同一个预算约束。预算用完就跳过等待直接 SIGKILL。
+	lp_cleanup_begin
 	lp_stop_pid "${command_pid:-}"
 	# 查询途中的看门狗也要结束：停止服务时 finish() 直接 exit，不会走到 lp_capture 里的回收，
 	# 留下的看门狗到期会向旧 PID 发 TERM/KILL。它剩下的 sleep 子进程没有任何后续动作，
@@ -21,47 +23,42 @@ cleanup_attempt() {
 		command_watchdog=""
 	fi
 	# 已被新连接接管时，只结束自己启动的进程，不碰新连接的路由和运行文件。
-	if ! lp_owns_session; then
+	if lp_owns_session; then
+		# 先结束 PPP 和 L2TP，再撤销 IPsec；阻断策略最后移除。
+		if [ -f "$LP_DIR/ppp.pid" ]; then
+			read -r ppp_pid < "$LP_DIR/ppp.pid"
+			case "$ppp_pid" in ''|*[!0-9]*) ;; *)
+				if [ "$(cat "/proc/$ppp_pid/comm" 2>/dev/null)" = pppd ]; then
+					lp_stop_pid "$ppp_pid"
+				fi
+			;; esac
+		fi
+		lp_stop_pid "${l2tp_pid:-}"
+		# --timeout 只限制 charon 那一侧；charon 卡住不回复时 swanctl 会一直等，所以再套一层超时。
+		# 上限 3 秒，实际还会被 lp_capture 按剩余预算收窄（TERM 后的宽限也计入）。
+		if [ -S "$LP_DIR/charon.vici" ]; then
+			lp_capture 3 /dev/null swanctl --terminate --ike "$LP_CONN" --timeout 2 --uri "$LP_URI"
+		fi
+		lp_stop_pid "${charon_pid:-}"
+		# ppp-hook 会在子进程里跑 routing down，停 DNS 进程也在同一个截止时刻之内
+		"$LP_LIB/ppp-hook" down >/dev/null 2>&1
+		if [ "${block_added:-0}" = 1 ]; then
+			ip xfrm policy delete dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 2>/dev/null
+		fi
+		if [ "${host_added:-0}" = 1 ]; then
+			ip -4 route del "$server_ip/32" metric 41717 2>/dev/null
+		fi
+		rm -f "$LP_DIR/ppp.pid" "$LP_DIR/ppp.up" "$LP_DIR/l2tp-control" "$LP_DIR/xl2tpd.pid" "$LP_DIR/charon.vici"
+		rm -f "$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options" "$LP_DIR/charon.pid" "$LP_DIR/peer-dns"
+		l2tp_pid=""; charon_pid=""; block_added=0; host_added=0
+	else
 		lp_stop_pid "${l2tp_pid:-}"
 		lp_stop_pid "${charon_pid:-}"
 		l2tp_pid=""; charon_pid=""
-		return 0
 	fi
-	# 先结束 PPP 和 L2TP，再撤销 IPsec；阻断策略最后移除。
-	if [ -f "$LP_DIR/ppp.pid" ]; then
-		read -r ppp_pid < "$LP_DIR/ppp.pid"
-		case "$ppp_pid" in ''|*[!0-9]*) ;; *)
-			if [ "$(cat "/proc/$ppp_pid/comm" 2>/dev/null)" = pppd ]; then
-				lp_stop_pid "$ppp_pid"
-			fi
-		;; esac
-	fi
-	lp_stop_pid "${l2tp_pid:-}"
-	# --timeout 只限制 charon 那一侧；charon 卡住不回复时 swanctl 会一直等，所以再套一层超时。
-	# 正常给 3 秒（--timeout 2 已限制住正常情况，留 1 秒余量）；预算不够时按剩下的给，
-	# 至少留 1 秒，免得前面的等待把 procd 的 15 秒吃光后这里还没配上。
-	if [ -S "$LP_DIR/charon.vici" ]; then
-		terminate_limit=3
-		[ -n "$LP_CLEANUP_LEFT" ] && [ "$LP_CLEANUP_LEFT" -lt "$terminate_limit" ] &&
-			terminate_limit="$LP_CLEANUP_LEFT"
-		[ "$terminate_limit" -lt 1 ] && terminate_limit=1
-		lp_capture "$terminate_limit" /dev/null swanctl --terminate --ike "$LP_CONN" --timeout 2 --uri "$LP_URI"
-		if [ -n "$LP_CLEANUP_LEFT" ]; then
-			LP_CLEANUP_LEFT=$((LP_CLEANUP_LEFT - terminate_limit))
-			[ "$LP_CLEANUP_LEFT" -lt 0 ] && LP_CLEANUP_LEFT=0
-		fi
-	fi
-	lp_stop_pid "${charon_pid:-}"
-	"$LP_LIB/ppp-hook" down >/dev/null 2>&1
-	if [ "${block_added:-0}" = 1 ]; then
-		ip xfrm policy delete dir out src 0.0.0.0/0 dst "$server_ip/32" proto udp sport 1701 dport 1701 2>/dev/null
-	fi
-	if [ "${host_added:-0}" = 1 ]; then
-		ip -4 route del "$server_ip/32" metric 41717 2>/dev/null
-	fi
-	rm -f "$LP_DIR/ppp.pid" "$LP_DIR/ppp.up" "$LP_DIR/l2tp-control" "$LP_DIR/xl2tpd.pid" "$LP_DIR/charon.vici"
-	rm -f "$LP_DIR/swanctl.conf" "$LP_DIR/ppp.options" "$LP_DIR/charon.pid" "$LP_DIR/peer-dns"
-	l2tp_pid=""; charon_pid=""; block_added=0; host_added=0
+	# 重连循环里紧跟着就是下一次连接，必须清掉，否则过期的预算会让 lp_capture 立刻强杀。
+	lp_cleanup_end
+	return 0
 }
 
 finish() {

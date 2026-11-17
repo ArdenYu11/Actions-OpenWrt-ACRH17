@@ -13,6 +13,36 @@
 7. 用 SSH 连上内网机器，保持 15 分钟以上不断开。
 8. 故意填错密码或不在手机上确认，页面给出 PPP 失败的提示，日志里写明自动重连已关闭。
 
+## 清理预算要覆盖宽限和子进程里的 DNS 停止（2026-11-17，v1.3.5）
+
+上一版给清理加了 `LP_CLEANUP_LEFT`（还剩几秒），但它是普通的 shell 变量、靠每步 sleep 自己扣：
+
+- `lp_capture` 到点先发 TERM，命令忽略 TERM 时还要再等 `LP_KILL_GRACE`（1 秒），
+  而调用方只扣了 `terminate_limit`，宽限那一秒漏在预算外；
+- `ppp-hook`、`routing` 是子进程，会重新加载 `common.sh`，`LP_CLEANUP_LEFT` 在那里被重置为空，
+  于是 `routing down` 停 DNS 时按单个进程的上限等 2 秒，完全不受剩余预算约束。
+
+隔离测试里 4 秒预算实际跑了 6.2 秒；换成 10 秒预算约 14.4 秒，已经贴住 procd 的 15 秒，
+路由规则删除稍慢一点就会被强杀，XFRM 策略和凭据留在内核里。
+
+改法：把「还剩几秒」换成绝对截止时刻 `LP_CLEANUP_DEADLINE`，并在清理开始时 `export`：
+
+- `lp_now` 取整秒，优先 `/proc/uptime`（单调，不怕对时跳变，也不用 fork），没有 `/proc` 时用 `date +%s`。
+- `lp_budget_left` 按当前时刻算出剩余秒数；不在清理流程里时返回 1，调用方仍按各自上限等。
+- `cleanup_attempt` 首行 `lp_cleanup_begin`（截止 = 现在 + `LP_CLEANUP_BUDGET`），末行 `lp_cleanup_end` 清空，
+  避免重连循环里的下一次连接被过期预算卡住。
+- `lp_capture` 先把宽限从剩余时间里预留出来（`limit = min(请求值, 剩余 - 宽限)`），
+  宽限本身也收窄到剩余时间，保证 TERM + 宽限 + KILL 不越过截止时刻。
+- `lp_stop_pid` 的上限取 `min(2, 剩余)`，剩余为 0 时直接 SIGKILL。
+- 子进程（`ppp-hook` → `routing down` 停 DNS）读到的就是同一个截止时刻，不再重新计时。
+
+验证：`tests/test_capture_timeout.py` 补到 20 项。新增「宽限 + 子进程清理共用一份预算」
+（4 秒预算里 3 秒超时 + 1 秒宽限用光后，子进程必须立即强杀，总耗时 < 5.5 秒）、
+「子进程看到的是剩余预算而不是新预算」、「真实 `cleanup_attempt` 只有一个截止时刻」
+（两段各 2 秒用光 4 秒预算后，ppp-hook 里的 `lp_stop_pid` 立即强杀，`elapsed <= 5`）、
+「取不到时间时退回各自上限」。
+在 `bfbb884` 上前三条分别报 `left=unset`、耗时 6.2 秒、`elapsed=6`，正好是这次报告的现象。
+
 ## 停止服务耗时 6 秒：僵尸进程与清理预算（2026-11-17）
 
 真机连上后点停止，`ps` 逐秒采样发现 6 秒才清完：pppd 停 2 秒、xl2tpd 停 2 秒、charon 再来 2 秒，
@@ -34,6 +64,7 @@
 - `cleanup_attempt` 开始处重置 `LP_CLEANUP_LEFT=$LP_CLEANUP_BUDGET`（10 秒），
   `lp_stop_pid` 每次等待都从预算里扣；预算不够就少等，用完直接 SIGKILL；
   `swanctl --terminate` 的上限也按剩余预算给，至少保留 1 秒。
+  （这一版的「累计扣秒」在 v1.3.5 换成了绝对截止时刻，原因见上一节：宽限漏扣、子进程会重置。）
 
 顺带说明真机上那个「第二个 worker」：它是 `lp_capture` 的看门狗 subshell，保留了脚本原来的
 argv，所以 `ps` 里显示成 `{worker}`，旁边的 `sleep 3` 就是它的预算、`sleep 1` 是宽限，
