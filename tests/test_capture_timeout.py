@@ -11,6 +11,10 @@
    只发 TERM 永远不会结束，等待一直挂着，清理执行不下去。
 
 前两条会让 IPsec 明明建立成功却被判成协商失败，第三条会让断开时的清理卡住。
+
+另外，清理必须在 procd 的 15 秒硬杀之前把 xfrm 策略和路由撤完，所以等待要共用
+一个绝对的截止时刻：只靠「还剩几秒」的话，TERM 后的宽限漏扣，子进程里重新加载
+common.sh 还会把它重置成一份新预算。
 """
 import os
 import pathlib
@@ -233,7 +237,8 @@ class CaptureTests(unittest.TestCase):
             'READY="$OUT.ready"; export READY\n'
             'sh -c \'trap "" TERM; : > "$READY"; while :; do :; done\' & p=$!\n'
             'while [ ! -f "$READY" ]; do sleep 0.05; done\n'
-            'LP_CLEANUP_LEFT=0\n'
+            # 截止时刻就是现在：剩余 0 秒
+            'LP_CLEANUP_DEADLINE=$(lp_now)\n'
             'lp_stop_pid "$p"\n'
             'printf \'rc=%s\\n\' "$?"\n'
             'wait "$p" 2>/dev/null; printf \'status=%s\\n\' "$?"\n'
@@ -252,6 +257,7 @@ class CaptureTests(unittest.TestCase):
             'READY="$OUT.ready"; export READY\n'
             'sh -c \'trap "" TERM; : > "$READY"; while :; do :; done\' & p=$!\n'
             'while [ ! -f "$READY" ]; do sleep 0.05; done\n'
+            'lp_cleanup_begin\n'
             'lp_stop_pid "$p"\n'
             'printf \'rc=%s\\n\' "$?"\n'
             'wait "$p" 2>/dev/null; printf \'status=%s\\n\' "$?"\n'
@@ -264,8 +270,117 @@ class CaptureTests(unittest.TestCase):
 
     def test_worker_cleanup_has_time_budget(self):
         body = worker_function('cleanup_attempt')
-        self.assertIn('LP_CLEANUP_LEFT=$LP_CLEANUP_BUDGET', body,
-                      '清理开始时要重置总预算，否则会拖到 procd 强杀')
+        self.assertIn('lp_cleanup_begin', body, '清理开始时要给一个截止时刻')
+        self.assertIn('lp_cleanup_end', body, '重连前要清掉截止时刻，否则下一次连接会被过期的预算卡住')
+        self.assertNotIn('LP_CLEANUP_LEFT', body, '累计扣秒会被子进程重置，应改用统一的截止时刻')
+
+    def test_cleanup_budget_covers_kill_grace_and_child_cleanup(self):
+        # P2 复现：只扣 terminate_limit 时，lp_capture 在 TERM 之后还要再等 LP_KILL_GRACE；
+        # 而 ppp-hook、routing 会在新进程里重新加载 common.sh，把「还剩几秒」重置成一份新预算，
+        # 停 DNS 那一段又白等 2 秒。名义 4 秒预算实际要花 6 秒以上。
+        # 现在截止时刻是绝对的并 export 出去，一次超时（3 秒 + 1 秒宽限）就把预算用光，
+        # 子进程里的 lp_stop_pid 立即强杀，不再额外等。
+        child = self.directory / 'child-cleanup.sh'
+        child.write_text(
+            '. ' + shlex.quote(str(COMMON)) + '\n'
+            'lp_budget_left; printf \'left=%s\\n\' "${LP_BUDGET_LEFT-unset}"\n'
+            'lp_stop_pid "$1"\n'
+            'printf \'child_rc=%s\\n\' "$?"\n'
+        )
+        started = time.monotonic()
+        result = self.shell(
+            'READY="$OUT.ready"; export READY\n'
+            f'CHILD={shlex.quote(str(child))}\n'
+            'LP_CLEANUP_BUDGET=4\n'
+            'lp_cleanup_begin\n'
+            'lp_capture 3 "$OUT" sh -c \'trap "" TERM; exec sleep 30\'; printf \'rc=%s\\n\' "$?"\n'
+            'sh -c \'trap "" TERM; : > "$READY"; while :; do :; done\' & p=$!\n'
+            'while [ ! -f "$READY" ]; do sleep 0.05; done\n'
+            'sh "$CHILD" "$p"\n'
+            'wait "$p" 2>/dev/null; printf \'status=%s\\n\' "$?"\n'
+            'lp_cleanup_end')
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('rc=124', result.stdout, '超时仍要统一报 124')
+        # 子进程拿到的是父进程的截止时刻（已用光），不是一份新的 4 秒预算
+        self.assertIn('left=0', result.stdout, '子进程重新开始计时了，预算被重置')
+        self.assertIn('status=137', result.stdout, '子进程里的清理没有强杀忽略 TERM 的进程')
+        self.assertLess(elapsed, 5.5, '宽限和子进程清理没有算进总预算')
+
+    def test_child_cleanup_sees_remaining_budget(self):
+        # export 的截止时刻要能被重新加载 common.sh 的子进程直接用，剩余时间按真实流逝减少
+        child = self.directory / 'child-budget.sh'
+        child.write_text(
+            '. ' + shlex.quote(str(COMMON)) + '\n'
+            'lp_budget_left; printf \'left=%s\\n\' "${LP_BUDGET_LEFT-unset}"\n'
+        )
+        result = self.shell(
+            f'CHILD={shlex.quote(str(child))}\n'
+            'LP_CLEANUP_BUDGET=6\n'
+            'lp_cleanup_begin\n'
+            'sleep 2\n'
+            'sh "$CHILD"\n'
+            'lp_cleanup_end\n'
+            'lp_budget_left; printf \'after=%s\\n\' "$?"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r'left=[34]\b', '子进程没有继承父进程的截止时刻')
+        self.assertIn('after=1', result.stdout, '清理结束后必须不再限制后续等待')
+
+    def test_cleanup_attempt_respects_one_deadline(self):
+        # 整段清理只能有一个截止时刻。这里跑 worker 里真实的 cleanup_attempt：
+        # 两段各等满 2 秒把 4 秒预算用光后，ppp-hook 子进程里的 lp_stop_pid 必须立刻强杀，
+        # 而不是重新拿到 2 秒——旧实现这里会多花 2 秒，正好是停 DNS 不受约束的那一段。
+        run_dir = self.directory / 'run'
+        run_dir.mkdir()
+        lib = self.directory / 'lib'
+        lib.mkdir()
+        hook = lib / 'ppp-hook'
+        hook.write_text(
+            '#!/bin/sh\n'
+            '. ' + shlex.quote(str(COMMON)) + '\n'
+            'lp_stop_pid "$(cat "$LP_DIR/dns.test.pid")"\n'
+        )
+        hook.chmod(0o755)
+        script = (
+            f'LP_DIR={shlex.quote(str(run_dir))}\n'
+            f'LP_LIB={shlex.quote(str(lib))}\n'
+            'export LP_DIR LP_LIB\n'
+            'printf \'%s\\n\' "$$" > "$LP_DIR/session"\n'
+            f'{worker_function("cleanup_attempt")}\n'
+            'READY="$OUT"; export READY\n'
+            'sh -c \'trap "" TERM; : > "$READY.a"; while :; do :; done\' & l2tp_pid=$!\n'
+            'sh -c \'trap "" TERM; : > "$READY.b"; while :; do :; done\' & charon_pid=$!\n'
+            'sh -c \'trap "" TERM; : > "$READY.c"; while :; do :; done\' & dns=$!\n'
+            'printf \'%s\\n\' "$dns" > "$LP_DIR/dns.test.pid"\n'
+            'while [ ! -f "$READY.c" ]; do sleep 0.05; done\n'
+            'LP_CLEANUP_BUDGET=4\n'
+            'started=$(date +%s)\n'
+            'cleanup_attempt\n'
+            'printf \'elapsed=%s\\n\' "$(( $(date +%s) - started ))"\n'
+            'wait "$dns" 2>/dev/null; printf \'dns=%s\\n\' "$?"\n'
+            'kill -9 "$l2tp_pid" "$charon_pid" 2>/dev/null\n'
+            'exit 0')
+        result = self.shell(script, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('dns=137', result.stdout, '预算用光后停 DNS 仍在等（旧实现重新给了一份预算）')
+        match = re.search(r'elapsed=(\d+)', result.stdout)
+        self.assertIsNotNone(match, result.stdout)
+        self.assertLessEqual(int(match.group(1)), 5,
+                             '整段清理超出了统一预算：4 秒预算不该花到 6 秒')
+
+    def test_budget_disabled_when_clock_unavailable(self):
+        # 取不到时间（没有 /proc 也没有 date）时不能把 $(( )) 算崩，
+        # 退回各自的上限，停止流程仍然能跑完。
+        result = self.shell(
+            'lp_now() { printf ""; }\n'
+            'LP_CLEANUP_BUDGET=2\n'
+            'lp_cleanup_begin; printf \'begin=%s\\n\' "$?"\n'
+            'lp_budget_left; printf \'left=%s\\n\' "$?"\n'
+            'lp_capture 1 "$OUT" /bin/sleep 30; printf \'rc=%s\\n\' "$?"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('begin=0', result.stdout, result.stderr)
+        self.assertIn('left=1', result.stdout, '没有截止时刻时应按各自上限等')
+        self.assertIn('rc=124', result.stdout, result.stderr)
 
     def test_scripts_do_not_use_fractional_sleep(self):
         pattern = re.compile(r'\bsleep\s+[0-9]+\.[0-9]+')
