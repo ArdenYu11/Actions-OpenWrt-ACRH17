@@ -83,13 +83,13 @@ class CaptureTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def shell(self, script):
+    def shell(self, script, timeout=20):
         env = dict(os.environ)
         env['PATH'] = f"{self.bin}:{env['PATH']}"
         prelude = f'OUT={shlex.quote(str(self.output))}\n'
         return subprocess.run(
             ['sh', '-c', '. ' + shlex.quote(str(COMMON)) + '\n' + prelude + script],
-            text=True, capture_output=True, env=env)
+            text=True, capture_output=True, env=env, timeout=timeout)
 
     def test_capture_survives_integer_only_sleep(self):
         result = self.shell(
@@ -201,6 +201,71 @@ class CaptureTests(unittest.TestCase):
         self.assertIn('start=ok', result.stdout, result.stderr)
         self.assertIn('live=0', result.stdout, result.stderr)
         self.assertIn('gone=1', result.stdout, result.stderr)
+
+    @unittest.skipUnless(os.path.isdir('/proc'), '需要 /proc 才能读进程状态')
+    def test_proc_state_reads_real_state(self):
+        result = self.shell('printf \'state=%s\\n\' "$(lp_proc_state $$)"')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout.strip(), r'^state=[RSD]$')
+
+    def test_zombie_counts_as_dead(self):
+        # busybox ash 不回收后台子进程，退出后一直是僵尸，kill -0 照样成功。
+        # 不算作已结束的话，每停一个进程都要白等满上限，断开一次会拖到 procd 的 15 秒。
+        # 这里用假的 /proc 读取验证判定本身，不依赖宿主是否回收子进程。
+        result = self.shell(
+            'lp_proc_state() { printf \'%s\' "$FAKE"; }\n'
+            'sleep 30 & p=$!\n'
+            'FAKE=Z; lp_alive "$p"; printf \'zombie=%s\\n\' "$?"\n'
+            'FAKE=S; lp_alive "$p"; printf \'running=%s\\n\' "$?"\n'
+            'FAKE=; lp_alive "$p"; printf \'unknown=%s\\n\' "$?"\n'
+            'kill -9 "$p"; wait "$p" 2>/dev/null\n'
+            'exit 0')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('zombie=1', result.stdout, '僵尸必须算作已结束')
+        self.assertIn('running=0', result.stdout, result.stderr)
+        self.assertIn('unknown=0', result.stdout, '取不到状态时按还活着处理，保证超时仍然生效')
+
+    def test_stop_pid_honours_cleanup_budget(self):
+        # 停止服务时 procd 只给 15 秒，预算用完必须立刻强杀，
+        # 把时间留给撤销 xfrm 策略和删路由，那几步才是断开后的残渣来源。
+        started = time.monotonic()
+        result = self.shell(
+            'READY="$OUT.ready"; export READY\n'
+            'sh -c \'trap "" TERM; : > "$READY"; while :; do :; done\' & p=$!\n'
+            'while [ ! -f "$READY" ]; do sleep 0.05; done\n'
+            'LP_CLEANUP_LEFT=0\n'
+            'lp_stop_pid "$p"\n'
+            'printf \'rc=%s\\n\' "$?"\n'
+            'wait "$p" 2>/dev/null; printf \'status=%s\\n\' "$?"\n'
+            'exit 0')
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('rc=0', result.stdout, result.stderr)
+        # 137 = 被 SIGKILL 结束；进程忽略 TERM，只有我们的补刀能给出这个状态
+        self.assertIn('status=137', result.stdout, '预算为 0 时应当直接 SIGKILL')
+        self.assertLess(elapsed, 1.5, '预算为 0 时不该再等整秒')
+
+    def test_stop_pid_waits_when_budget_allows(self):
+        # 预算充足时仍然给进程体面退出的机会，只是上限仍是 2 秒
+        started = time.monotonic()
+        result = self.shell(
+            'READY="$OUT.ready"; export READY\n'
+            'sh -c \'trap "" TERM; : > "$READY"; while :; do :; done\' & p=$!\n'
+            'while [ ! -f "$READY" ]; do sleep 0.05; done\n'
+            'lp_stop_pid "$p"\n'
+            'printf \'rc=%s\\n\' "$?"\n'
+            'wait "$p" 2>/dev/null; printf \'status=%s\\n\' "$?"\n'
+            'exit 0')
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('status=137', result.stdout, '忽略 TERM 的进程最终也要被 KILL')
+        self.assertGreater(elapsed, 1.5, '正常情况下应当先等一等再强杀')
+        self.assertLess(elapsed, 5, '单个进程最多等 2 秒')
+
+    def test_worker_cleanup_has_time_budget(self):
+        body = worker_function('cleanup_attempt')
+        self.assertIn('LP_CLEANUP_LEFT=$LP_CLEANUP_BUDGET', body,
+                      '清理开始时要重置总预算，否则会拖到 procd 强杀')
 
     def test_scripts_do_not_use_fractional_sleep(self):
         pattern = re.compile(r'\bsleep\s+[0-9]+\.[0-9]+')
